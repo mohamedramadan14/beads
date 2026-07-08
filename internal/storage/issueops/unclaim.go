@@ -30,9 +30,11 @@ import (
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func UnclaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string, force bool) error {
-	// Read current issue
-	issueTable := "issues"
-	eventTable := "events"
+	// Route to the correct table (issues/wisps) automatically, matching
+	// ClaimIssueInTx — a wisp claim lives in the wisp tables, so its release
+	// must update them too rather than no-op against the permanent issues table.
+	isWisp := IsActiveWispInTx(ctx, tx, id)
+	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
 
 	oldIssue, err := GetIssueInTx(ctx, tx, id)
 	if err != nil {

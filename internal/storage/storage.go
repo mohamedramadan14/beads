@@ -28,12 +28,6 @@ var ErrNotClaimable = errors.New("issue not claimable")
 // escape hatch (bd unclaim --force), reserved for admin/reaper use.
 var ErrNotOwner = errors.New("issue claimed by a different actor")
 
-// ErrAssigneeMismatch is returned by UnclaimIssueIfAssignee when the issue's
-// current assignee does not match the expected assignee (including when the
-// issue is no longer assigned at all). The caller's view of the claim was
-// stale; the issue is left untouched.
-var ErrAssigneeMismatch = errors.New("assignee mismatch")
-
 // ErrNotFound is returned when a requested entity does not exist in the database.
 var ErrNotFound = errors.New("not found")
 
@@ -57,11 +51,6 @@ type Storage interface {
 	UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error
 	ReopenIssue(ctx context.Context, id string, reason string, actor string) error
 	UnclaimIssue(ctx context.Context, id string, actor string, force bool) error
-	// UnclaimIssueIfAssignee releases a claim only while the issue is still
-	// assigned to expectedAssignee (compare-and-swap, the inverse of
-	// ClaimIssue). Returns ErrAssigneeMismatch, leaving the issue untouched,
-	// when the current assignee differs.
-	UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string) error
 	UpdateIssueType(ctx context.Context, id string, issueType string, actor string) error
 	CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error
 	DeleteIssue(ctx context.Context, id string) error
@@ -259,19 +248,6 @@ type Flattener interface {
 	Flatten(ctx context.Context) error
 }
 
-// RemoteRefPruner manages the cached remote-tracking refs that anchor Dolt
-// history. After a squash (Flatten/Compact) those refs still point at the
-// pre-squash chain, making the follow-up GC a silent no-op on any workspace
-// that has ever pushed or fetched (bd-agctw) — callers must prune them before
-// GC. Pruning only touches the local cache; the next push/fetch re-creates
-// the refs at the new tip. Tags anchor history the same way but are
-// user-created, so they are listed for warning rather than deleted.
-type RemoteRefPruner interface {
-	ListRemoteRefs(ctx context.Context) ([]string, error)
-	PruneRemoteRefs(ctx context.Context) ([]string, error)
-	ListTags(ctx context.Context) ([]string, error)
-}
-
 type SchemaMigrator interface {
 	ApplySchemaMigrations(ctx context.Context) (applied int, err error)
 }
@@ -389,13 +365,12 @@ type Transaction interface {
 	AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error
 	RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error
 	GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error)
-	// CycleThroughEdges reports a rendered cycle in the static scheduling set
-	// (blocks, conditional-blocks, parent-child; not waits-for) that traverses
-	// one of the given new edges (issueID -> dependsOnID pairs), or
+	// CycleThroughEdges reports a rendered blocking-dependency cycle that
+	// traverses one of the given new edges (issueID -> dependsOnID pairs), or
 	// "" when none does. It sees the transaction's own uncommitted dependency
 	// writes, which must already include the edges. Lets bulk paths that add
-	// edges run one merged whole-graph check before commit and roll back instead
-	// of committing cycles (bd-6dnrw.8); pre-existing
+	// edges with SkipCycleCheck run one whole-graph check before commit and
+	// roll back instead of committing cycles (bd-6dnrw.8); pre-existing
 	// cycles not using any of the new edges never block (bd-578h9.9).
 	CycleThroughEdges(ctx context.Context, edges [][2]string) (string, error)
 
@@ -427,8 +402,8 @@ type Transaction interface {
 // DependencyAddOptions controls transaction-scoped dependency insertion.
 type DependencyAddOptions struct {
 	// SkipCycleCheck bypasses the recursive pre-insert cycle check. Callers
-	// that set it MUST run Transaction.CycleThroughEdges before commit and fail
-	// on new blocks/conditional-blocks/parent-child cycles (waits-for is excluded) — skipping the per-edge check trades
+	// that set it MUST run Transaction.DetectCycles before commit and fail
+	// the transaction on new cycles — skipping the per-edge check trades
 	// per-edge cost for one whole-graph check, never graph integrity
 	// (bd-6dnrw.8).
 	SkipCycleCheck bool

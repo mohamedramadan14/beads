@@ -273,20 +273,29 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 }
 
 // HeartbeatIssue refreshes the lease on an issue actor holds in_progress,
-// pushing lease_expires_at forward on its row in the ephemeral leases table
-// (see issueops.lease). Deliberately NO DOLT_ADD/DOLT_COMMIT: the leases
-// table is dolt_ignored, so a heartbeat mints no commit and no history — this
-// is the whole point of bd-lrgn1 (fleet heartbeats were the dominant source
-// of unbounded reachable history). Wrapped in withRetryTx so a heartbeat that
-// loses Dolt's optimistic merge to a concurrent reclaim/close on the same
-// lease row is replayed against a fresh snapshot rather than surfaced.
+// pushing lease_expires_at forward and rewriting row_lock (see issueops.lease).
+// Wrapped in withRetryTx so a heartbeat that loses Dolt's optimistic merge to a
+// concurrent reclaim/close on the same row is replayed against a fresh snapshot
+// rather than surfaced — the row_lock collision is what forces that retry.
 func (s *DoltStore) HeartbeatIssue(ctx context.Context, id, actor string) error {
 	if s.isActiveWisp(ctx, id) {
 		// Wisps are ephemeral and never leased; nothing to heartbeat.
 		return fmt.Errorf("%w: %s is ephemeral", storage.ErrNotClaimable, id)
 	}
 	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		return issueops.HeartbeatIssueInTx(ctx, tx, id, actor)
+		if err := issueops.HeartbeatIssueInTx(ctx, tx, id, actor); err != nil {
+			return err
+		}
+		// GH#2455: stage only the tables we touched, then commit without -A.
+		for _, table := range []string{"issues"} {
+			_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+		}
+		commitMsg := fmt.Sprintf("bd: heartbeat %s", id)
+		if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+			return fmt.Errorf("dolt commit: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -323,7 +332,7 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 }
 
 // UnclaimIssue atomically unclaims an issue by clearing the assignee, resetting
-// status to "open", deleting its lease row and rewriting row_lock. Records
+// status to "open", clearing the lease columns and rewriting row_lock. Records
 // an "unclaimed" event. Only the current assignee may release its own claim
 // unless force is set (admin/reaper override). Delegates SQL work to
 // issueops.UnclaimIssueInTx; handles Dolt-specific concerns (DOLT_ADD/COMMIT).
@@ -334,32 +343,6 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, force bool) error {
 	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		if err := issueops.UnclaimIssueInTx(ctx, tx, id, actor, force); err != nil {
-			return err
-		}
-
-		// Dolt versioning for permanent issues.
-		for _, table := range []string{"issues", "events"} {
-			_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
-		}
-		commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-		if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
-			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
-			return fmt.Errorf("dolt commit: %w", err)
-		}
-		return nil
-	})
-}
-
-// UnclaimIssueIfAssignee releases a claim only while the issue is still assigned
-// to expectedAssignee (compare-and-swap, the inverse of ClaimIssue). Returns
-// storage.ErrAssigneeMismatch, leaving the issue untouched, when the current
-// assignee differs. Delegates SQL work to issueops.UnclaimIssueIfAssigneeInTx;
-// handles Dolt-specific concerns (DOLT_ADD/COMMIT). Wrapped in withRetryTx like
-// UnclaimIssue so a concurrent writer that loses Dolt's optimistic commit-time
-// merge is retried rather than surfaced as a hard failure.
-func (s *DoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		if err := issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee); err != nil {
 			return err
 		}
 

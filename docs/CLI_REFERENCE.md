@@ -1307,6 +1307,14 @@ On stores with lease.auto=off (see 'bd lease disarm'), claims carry no
 lease unless explicitly requested, so reclaim only ever touches explicitly
 requested leases there.
 
+UPGRADE NOTE: earlier binaries stamped a lease on every claim (both tiers)
+but only ever reclaimed the issues table. Reclaim now also sweeps the wisps
+table, so on an auto-on store upgrading across this change the first run can
+reclaim in_progress wisp rows whose leases went stale under the old binary.
+Run 'bd lease disarm' first (it clears armed leases on both tiers) if that
+recovery is not wanted, or let live workers heartbeat within the grace
+window to refresh their leases.
+
 Examples:
   bd reclaim                       # default grace window (2× the lease TTL)
   bd reclaim --older-than 10m      # reclaim leases expired &gt;10m ago
@@ -1620,6 +1628,7 @@ bd update [id...] [flags]
       --history                      Clear no-history flag (re-enable Dolt commit history)
       --if-assignee string           Only mutate while the issue is still assigned to this actor; empty asserts unassigned (mismatch: exit 9, unsupported path: exit 13)
       --if-fence int                 Only mutate while claim_fence still equals this snapshot value (mismatch: exit 9, unsupported path: exit 13)
+      --lease-ttl duration           With --claim: request a lease with this TTL (stamps even when lease.auto=off; renew with bd heartbeat, recover with bd reclaim)
       --metadata string              Set custom metadata (JSON string or @file.json to read from file)
       --no-history                   Mark issue as no-history (skip Dolt commits, not GC-eligible)
       --notes string                 Additional notes
@@ -7071,6 +7080,7 @@ bd ready [flags]
       --include-ephemeral            Include ephemeral issues (wisps) in results
   -l, --label strings                Filter by labels (AND: must have ALL). Can combine with --label-any
       --label-any strings            Filter by labels (OR: must have AT LEAST ONE). Can combine with --label
+      --lease-ttl duration           With --claim: request a lease with this TTL (stamps even when lease.auto=off)
   -n, --limit int                    Maximum issues to show (use 0 for unlimited) (default 100)
       --metadata-field stringArray   Filter by metadata field (key=value, repeatable)
       --mol string                   Filter to steps within a specific molecule

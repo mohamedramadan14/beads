@@ -340,6 +340,23 @@ stderr, and the command exits nonzero.`,
 			}
 		}
 
+		// Resolve the requested-lease TTL once, before the per-ID loop. A lease
+		// request without --claim is refused loudly rather than silently
+		// dropped: a caller who believes it stamped a lease but did not would
+		// leave the claim invisible to bd reclaim — the stranded-work exposure
+		// this feature exists to close.
+		claimCtx := ctx
+		if cmd.Flags().Changed("lease-ttl") {
+			if !claimFlag {
+				return HandleErrorRespectJSON("--lease-ttl requires --claim (it requests a lease on the claim)")
+			}
+			ttl, _ := cmd.Flags().GetDuration("lease-ttl")
+			if ttl <= 0 {
+				return HandleErrorRespectJSON("--lease-ttl must be positive")
+			}
+			claimCtx = issueops.WithLeaseTTL(ctx, ttl)
+		}
+
 		updatedIssues := []*types.Issue{}
 		var firstUpdatedID string // Track first successful update for last-touched
 		var failures []updateIDFailure
@@ -405,7 +422,7 @@ stderr, and the command exits nonzero.`,
 
 			// Handle claim operation atomically using compare-and-swap semantics
 			if claimFlag {
-				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor); err != nil {
+				if err := issueStore.ClaimIssue(claimCtx, result.ResolvedID, actor); err != nil {
 					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
 					// Typed body alongside the frozen text (additive contract):
 					// old consumers substring-match the line above, new ones
@@ -822,6 +839,7 @@ func init() {
 	updateCmd.Flags().StringArray("set-metadata", nil, "Set metadata key=value (repeatable, e.g., --set-metadata team=platform)")
 	updateCmd.Flags().StringArray("unset-metadata", nil, "Remove metadata key (repeatable, e.g., --unset-metadata team)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
+	updateCmd.Flags().Duration("lease-ttl", 0, "With --claim: request a lease with this TTL (stamps even when lease.auto=off; renew with bd heartbeat, recover with bd reclaim)")
 	registerOwnershipGuardFlags(updateCmd)
 	rootCmd.AddCommand(updateCmd)
 }

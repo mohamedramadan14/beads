@@ -1347,6 +1347,12 @@ func (s SortPolicy) IsValid() bool {
 type ReclaimedLease struct {
 	ID            string `json:"id"`
 	PreviousOwner string `json:"previous_owner"`
+	// Tier is the physical table the lease was reclaimed from ("issues" or
+	// "wisps") so callers can project recovery events correctly.
+	Tier string `json:"tier,omitempty"`
+	// Fence is the row's claim_fence AFTER the reclaim's bump: the previous
+	// holder is fenced out, and any guard quoting an older fence conflicts.
+	Fence int64 `json:"claim_fence,omitempty"`
 }
 
 // WorkFilter is used to filter ready work queries

@@ -38,6 +38,7 @@ bd update [id...] [flags]
       --history                      Clear no-history flag (re-enable Dolt commit history)
       --if-assignee string           Only mutate while the issue is still assigned to this actor; empty asserts unassigned (mismatch: exit 9, unsupported path: exit 13)
       --if-fence int                 Only mutate while claim_fence still equals this snapshot value (mismatch: exit 9, unsupported path: exit 13)
+      --lease-ttl duration           With --claim: request a lease with this TTL (stamps even when lease.auto=off; renew with bd heartbeat, recover with bd reclaim)
       --metadata string              Set custom metadata (JSON string or @file.json to read from file)
       --no-history                   Mark issue as no-history (skip Dolt commits, not GC-eligible)
       --notes string                 Additional notes

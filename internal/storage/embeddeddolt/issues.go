@@ -66,11 +66,9 @@ func (s *EmbeddedDoltStore) UpdateIssue(ctx context.Context, id string, updates 
 // HeartbeatIssue refreshes the lease on an issue actor holds in_progress.
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
 func (s *EmbeddedDoltStore) HeartbeatIssue(ctx context.Context, id, actor string) error {
+	// Tier-complete: issueops routes wisp-table rows (durable no_history work
+	// included) to their own table; unleased rows get ErrUnleased there.
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		if issueops.IsActiveWispInTx(ctx, tx, id) {
-			// Wisps are ephemeral and never leased; nothing to heartbeat.
-			return fmt.Errorf("%w: %s is ephemeral", storage.ErrNotClaimable, id)
-		}
 		return issueops.HeartbeatIssueInTx(ctx, tx, id, actor)
 	})
 }
@@ -128,6 +126,29 @@ func (s *EmbeddedDoltStore) DisarmAutoLeases(ctx context.Context) (int64, error)
 		}
 	}
 	return total, nil
+}
+
+// RenewLeases renews the given (id, fence) leases in one transaction.
+func (s *EmbeddedDoltStore) RenewLeases(ctx context.Context, refs []storage.LeaseRef, ttl time.Duration) ([]storage.LeaseRenewalResult, error) {
+	var out []storage.LeaseRenewalResult
+	err := s.withConn(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		out, err = issueops.RenewLeasesInTx(ctx, tx, refs, ttl)
+		return err
+	})
+	return out, err
+}
+
+// CountActiveClaimsByOwner counts in_progress claims held by owner across both
+// tiers.
+func (s *EmbeddedDoltStore) CountActiveClaimsByOwner(ctx context.Context, owner string) (int, error) {
+	var n int
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		n, err = issueops.CountActiveClaimsByOwnerInTx(ctx, tx, owner)
+		return err
+	})
+	return n, err
 }
 
 // ReopenIssue reopens a closed issue, setting status to open and clearing

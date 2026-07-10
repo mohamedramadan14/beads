@@ -289,24 +289,44 @@ func ClearArmedLeasesInTx(ctx context.Context, tx DBTX, issueTable string) (int6
 // (the supervisor uses graceWindow = 2×TTL) so only leases that expired a safe
 // margin ago — i.e. workers that are almost certainly dead — are reclaimed.
 //
-// Reclaim only ever touches the permanent issues table: wisps are ephemeral and
-// are never leased work. Returns the issues it reverted (id + the owner it took
-// the lease from) so the caller can log/emit recovery events. The caller owns
-// Dolt versioning.
+// Reclaim is tier-complete: it sweeps both the permanent issues table and the
+// wisps table (which holds durable no_history work), recording recovery
+// events in the tier's own event table. Only rows carrying a lease are ever
+// touched — with requested-lease semantics (lease.auto off), unleased claims
+// are invisible to the reaper regardless of tier. Each result reports the
+// tier and the row's post-bump claim_fence so the previous holder is fenced
+// out and callers can project recovery correctly. The caller owns Dolt
+// versioning.
 func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, actor string) ([]types.ReclaimedLease, error) {
+	var reclaimed []types.ReclaimedLease
+	for _, tier := range []struct{ issueTable, eventTable string }{
+		{"issues", "events"},
+		{"wisps", "wisp_events"},
+	} {
+		got, err := reclaimExpiredInTable(ctx, tx, tier.issueTable, tier.eventTable, cutoff, actor)
+		if err != nil {
+			return nil, err
+		}
+		reclaimed = append(reclaimed, got...)
+	}
+	return reclaimed, nil
+}
+
+//nolint:gosec // G201: table names are the hardcoded tier constants above
+func reclaimExpiredInTable(ctx context.Context, tx DBTX, issueTable, eventTable string, cutoff time.Time, actor string) ([]types.ReclaimedLease, error) {
 	// Snapshot the stale set first so we can report exactly which issues we
 	// reverted and record per-issue recovery events. The UPDATE below repeats
 	// the predicate, so an issue that a concurrent heartbeat rescued between the
 	// SELECT and the UPDATE is simply skipped (0 rows) — it never appears as
 	// reclaimed.
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, COALESCE(assignee, '') FROM issues
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id, COALESCE(assignee, '') FROM %s
 		WHERE status = 'in_progress'
 		  AND lease_expires_at IS NOT NULL
 		  AND lease_expires_at < ?
-	`, cutoff)
+	`, issueTable), cutoff)
 	if err != nil {
-		return nil, fmt.Errorf("scan for stale leases: %w", err)
+		return nil, fmt.Errorf("scan for stale leases in %s: %w", issueTable, err)
 	}
 	var stale []types.ReclaimedLease
 	for rows.Next() {
@@ -315,6 +335,7 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, ac
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan stale lease row: %w", err)
 		}
+		r.Tier = issueTable
 		stale = append(stale, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -329,20 +350,21 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, ac
 	}
 
 	var reclaimed []types.ReclaimedLease
-	for _, r := range stale {
+	for i := range stale {
+		r := &stale[i]
 		// Re-check the predicate inside the UPDATE so a heartbeat that landed
 		// after the snapshot (pushing lease_expires_at back into the future, or
 		// the row already closed) cannot be clobbered. row_lock makes the racing
 		// writer conflict; this WHERE makes a winning racer's rescue stick.
-		res, err := tx.ExecContext(ctx, `
-			UPDATE issues
+		res, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE %s
 			SET status = 'open', assignee = NULL, started_at = NULL,
 			    lease_expires_at = NULL, heartbeat_at = NULL,
 			    claim_fence = claim_fence + 1,
 			    updated_at = ?, row_lock = ?
 			WHERE id = ? AND status = 'in_progress'
 			  AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
-		`, time.Now().UTC(), freshRowLock(), r.ID, cutoff)
+		`, issueTable), time.Now().UTC(), freshRowLock(), r.ID, cutoff)
 		if err != nil {
 			return nil, fmt.Errorf("reclaim %s: %w", r.ID, err)
 		}
@@ -353,11 +375,17 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, ac
 		if n == 0 {
 			continue // rescued by a concurrent heartbeat/close — leave it be
 		}
-		if err := RecordFullEventInTable(ctx, tx, "events", r.ID, types.EventLeaseReclaimed, actor,
+		// Report the post-bump fence so the caller holds the value that fences
+		// out the previous holder.
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf(
+			`SELECT claim_fence FROM %s WHERE id = ?`, issueTable), r.ID).Scan(&r.Fence); err != nil {
+			return nil, fmt.Errorf("read post-reclaim fence for %s: %w", r.ID, err)
+		}
+		if err := RecordFullEventInTable(ctx, tx, eventTable, r.ID, types.EventLeaseReclaimed, actor,
 			r.PreviousOwner, ""); err != nil {
 			return nil, fmt.Errorf("record reclaim event for %s: %w", r.ID, err)
 		}
-		reclaimed = append(reclaimed, r)
+		reclaimed = append(reclaimed, *r)
 	}
 	return reclaimed, nil
 }

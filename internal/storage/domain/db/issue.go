@@ -128,14 +128,28 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	// Ownership transitions bump the fence, paired with a row_lock rewrite in
 	// the same statement — the proxied path shares issueops' transition
 	// predicate so the two dispatch layers cannot drift (see issueops/fence.go).
+	rowLockRewritten := false
 	if issueops.IsOwnershipTransition(oldStatus, oldAssignee.String, updates) {
 		setClauses = append(setClauses, issueops.FenceBumpExpr, "row_lock = ?")
 		args = append(args, issueops.FreshRowLock())
+		rowLockRewritten = true
+	}
+
+	// An ownership guard folds into the WHERE (see issueops/guard.go). When
+	// guarded, also rewrite row_lock so an identical-value update still
+	// affects the row — otherwise a no-change write would masquerade as a
+	// precondition failure.
+	guard, hasGuard := issueops.GuardFrom(ctx)
+	if hasGuard && !rowLockRewritten {
+		setClauses = append(setClauses, "row_lock = ?")
+		args = append(args, issueops.FreshRowLock())
 	}
 	args = append(args, id)
+	guardClause, guardArgs := issueops.GuardWhereClause(guard)
+	args = append(args, guardArgs...)
 
 	//nolint:gosec // G201: table is one of two hardcoded constants
-	q := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", table, strings.Join(setClauses, ", "))
+	q := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?%s", table, strings.Join(setClauses, ", "), guardClause)
 	res, err := r.runner.ExecContext(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("db: Update %s: %w", id, err)
@@ -145,6 +159,9 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 		return fmt.Errorf("db: Update %s: rows affected: %w", id, err)
 	}
 	if rows == 0 {
+		if hasGuard {
+			return issueops.GuardPreconditionError(ctx, r.runner, table, id, guard)
+		}
 		return fmt.Errorf("db: Update %s: %w", id, sql.ErrNoRows)
 	}
 

@@ -102,7 +102,10 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		}
 		if assignee != "" && assignee != actor {
 			if currentStatus == types.StatusOpen {
-				return nil, fmt.Errorf("issue already assigned to %q. Use `bd unclaim %s` to release it before re-claiming", assignee, id)
+				// Wrapped in ErrAlreadyClaimed so exit-code/JSON consumers can
+				// classify the loss; the phrasing stays matcher-compatible
+				// ("already claimed" is in the frozen substring set).
+				return nil, fmt.Errorf("%w: assigned to %q. Use `bd unclaim %s` to release it before re-claiming", storage.ErrAlreadyClaimed, assignee, id)
 			}
 			return nil, fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
 		}

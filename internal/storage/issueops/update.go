@@ -282,10 +282,27 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 
 	args = append(args, id)
 
+	// An ownership guard folds into the WHERE (see guard.go); row_lock is
+	// rewritten unconditionally above, so a guard-matched update always
+	// affects the row and a 0-row result is a genuine precondition failure.
+	guard, hasGuard := GuardFrom(ctx)
+	guardClause, guardArgs := guard.whereClause()
+	args = append(args, guardArgs...)
+
 	//nolint:gosec // G201: issueTable comes from WispTableRouting (hardcoded constants)
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", issueTable, strings.Join(setClauses, ", "))
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?%s", issueTable, strings.Join(setClauses, ", "), guardClause)
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
 		return nil, fmt.Errorf("failed to update issue: %w", err)
+	}
+	if hasGuard {
+		rows, rerr := result.RowsAffected()
+		if rerr != nil {
+			return nil, fmt.Errorf("failed to get rows affected: %w", rerr)
+		}
+		if rows == 0 {
+			return nil, GuardPreconditionError(ctx, tx, issueTable, id, guard)
+		}
 	}
 
 	if recordEvent {

@@ -45,15 +45,23 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 
 	now := time.Now().UTC()
 
+	// An ownership guard (--if-assignee/--if-fence) folds into the WHERE so
+	// the check-and-close is one atomic compare-and-swap (see guard.go).
+	guard, hasGuard := GuardFrom(ctx)
+	guardClause, guardArgs := guard.whereClause()
+
 	// row_lock is rewritten on close so a concurrent reclaim (which also rewrites
 	// row_lock) collides on this cell and is forced to conflict-and-retry rather
 	// than silently cell-merging a revert-to-ready over a completed close (see
-	// lease.go). The lease row is deleted below: a closed issue holds no lease.
+	// lease.go). lease_expires_at/heartbeat_at are cleared: a closed issue holds
+	// no lease.
+	args := []interface{}{types.StatusClosed, now, now, reason, session, freshRowLock(), id, types.StatusClosed}
+	args = append(args, guardArgs...)
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?,
-			row_lock = ?
-		WHERE id = ? AND status != ?
-	`, issueTable), types.StatusClosed, now, now, reason, session, freshRowLock(), id, types.StatusClosed)
+			lease_expires_at = NULL, heartbeat_at = NULL, row_lock = ?
+		WHERE id = ? AND status != ?%s
+	`, issueTable, guardClause), args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to close issue: %w", err)
 	}
@@ -74,14 +82,27 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 			return nil, fmt.Errorf("failed to check issue existence: %w", qerr)
 		}
 		if types.Status(status) == types.StatusClosed {
+			if hasGuard {
+				// Idempotency must not bypass the guard: a zombie's stale
+				// snapshot on an already-closed row is a conflict, not a
+				// false completion signal. A legitimate same-caller retry
+				// still matches (close neither clears assignee nor bumps the
+				// fence) and keeps the AlreadyClosed success.
+				matched, merr := GuardMatchesCurrentRow(ctx, tx, issueTable, id, guard)
+				if merr != nil {
+					return nil, merr
+				}
+				if !matched {
+					return nil, GuardPreconditionError(ctx, tx, issueTable, id, guard)
+				}
+			}
 			return &CloseResult{IsWisp: isWisp, AlreadyClosed: true}, nil
 		}
+		if hasGuard {
+			// The row exists and is not closed — the guard is what failed.
+			return nil, GuardPreconditionError(ctx, tx, issueTable, id, guard)
+		}
 		return nil, fmt.Errorf("failed to close issue: %s", id)
-	}
-
-	// A closed issue holds no lease (no-op for wisps, which are never leased).
-	if err := DeleteLeaseInTx(ctx, tx, id); err != nil {
-		return nil, err
 	}
 
 	if recordEvent {

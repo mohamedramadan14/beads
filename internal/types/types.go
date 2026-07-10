@@ -53,6 +53,14 @@ type Issue struct {
 	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"` // When the current claim's lease expires
 	HeartbeatAt    *time.Time `json:"heartbeat_at,omitempty"`     // Last heartbeat from the lease owner
 
+	// ===== Ownership fence (migration 0055) =====
+	// Monotonic counter bumped only on ownership transitions (claim, unclaim,
+	// reclaim, assignee change, reopen, transfer) — never by content
+	// mutations. Guarded verbs compare it so a stale ownership snapshot gets a
+	// typed conflict instead of stomping newer ownership. No omitempty: 0 is
+	// the meaningful "never claimed" state and consumers snapshot the value.
+	ClaimFence int64 `json:"claim_fence"`
+
 	// ===== Time-Based Scheduling (GH#820) =====
 	DueAt      *time.Time `json:"due_at,omitempty"`      // When this issue should be completed
 	DeferUntil *time.Time `json:"defer_until,omitempty"` // Hide from bd ready until this time

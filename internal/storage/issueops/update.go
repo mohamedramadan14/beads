@@ -88,30 +88,13 @@ func ManageStartedAt(oldIssue *types.Issue, updates map[string]interface{}, setC
 }
 
 // ManageLeaseOnUpdate keeps lease ownership coherent when generic updates alter
-// status or assignee. Leases are armed ONLY by the lease-aware verbs — claim
-// (ClaimIssueInTx, bd update --claim, bd ready --claim) and heartbeat — never by
-// a generic update. A bare `bd update -s in_progress -a <who>` is an interactive
-// hand-dole claim: nobody is heartbeating it, so arming a lease here just turns
-// the claim into reclaim-bait that reverts to open after the TTL (bd-9hpgf,
-// GH#4716). This helper therefore only ever CLEARS lease columns:
-//
-//   - the update moves the row out of the claimed state (not in_progress, or
-//     unassigned): any lease is stale — clear it.
-//   - the update changes who holds the claim (assignee transfer, or a fresh
-//     transition into in_progress): the previous owner's lease must not count
-//     down against the new holder — clear it. The new holder gets a lease only
-//     via the claim verb; a real worker's next heartbeat re-arms one.
-//   - the update leaves the same claim in place (already in_progress, same
-//     assignee): leave the lease untouched, so a worker's live lease survives
-//     unrelated edits to its issue.
-//
-// Returns true when the update ends/transfers the claim and the issue's lease
-// row must be deleted (DeleteLeaseInTx) after the row update.
-func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}) bool {
+// status or assignee. Claim/heartbeat own the normal lease lifecycle, but bd
+// update can transfer or reopen work directly.
+func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}, setClauses []string, args []interface{}, ctx context.Context) ([]string, []interface{}) {
 	rawStatus, hasStatus := updates["status"]
 	rawAssignee, hasAssignee := updates["assignee"]
 	if !hasStatus && !hasAssignee {
-		return false
+		return setClauses, args
 	}
 
 	newStatus := string(oldIssue.Status)
@@ -122,7 +105,7 @@ func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}) 
 		case types.Status:
 			newStatus = string(v)
 		default:
-			return false
+			return setClauses, args
 		}
 	}
 
@@ -138,9 +121,15 @@ func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}) 
 		}
 	}
 
-	sameClaim := newStatus == string(types.StatusInProgress) && newAssignee != "" &&
-		oldIssue.Status == types.StatusInProgress && newAssignee == oldIssue.Assignee
-	return !sameClaim
+	if newStatus != string(types.StatusInProgress) || newAssignee == "" {
+		setClauses = append(setClauses, "lease_expires_at = NULL", "heartbeat_at = NULL")
+		return setClauses, args
+	}
+
+	now := time.Now().UTC()
+	setClauses = append(setClauses, "lease_expires_at = ?", "heartbeat_at = ?")
+	args = append(args, now.Add(leaseTTL(ctx)), now)
+	return setClauses, args
 }
 
 // DetermineEventType returns the appropriate event type for an update.
@@ -272,14 +261,22 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	setClauses, args = ManageStartedAt(oldIssue, updates, setClauses, args)
 
 	// Auto-manage leases when direct updates change status or assignee.
-	// Clears stale leases only; arming is reserved for claim/heartbeat.
-	clearLease := ManageLeaseOnUpdate(oldIssue, updates)
+	setClauses, args = ManageLeaseOnUpdate(oldIssue, updates, setClauses, args, ctx)
 
-	// Rewrite row_lock on every update so a concurrent status/ownership
-	// mutation (reclaim/close) collides on this shared cell and is forced to
-	// conflict-and-retry rather than silently cell-merging two writes to
-	// different columns of the same row (see lease.go). This is the "every
-	// mutating path writes row_lock" invariant the lease scheme depends on.
+	// Ownership transitions through the generic update path bump the fence:
+	// an assignee change, or a reopen (closed→open) — the primary reopen path
+	// on the dolt/embedded stores, whose ReopenIssue delegates here. The
+	// bump⇒row_lock pairing invariant holds because row_lock is rewritten
+	// unconditionally just below.
+	if IsOwnershipTransition(oldIssue.Status, oldIssue.Assignee, updates) {
+		setClauses = append(setClauses, fenceBumpExpr)
+	}
+
+	// Rewrite row_lock on every update so a concurrent lease mutation (heartbeat/
+	// reclaim) collides on this shared cell and is forced to conflict-and-retry
+	// rather than silently cell-merging two writes to different columns of the
+	// same row (see lease.go). This is the "every mutating path writes row_lock"
+	// invariant the lease scheme depends on.
 	setClauses = append(setClauses, "row_lock = ?")
 	args = append(args, freshRowLock())
 
@@ -289,12 +286,6 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", issueTable, strings.Join(setClauses, ", "))
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return nil, fmt.Errorf("failed to update issue: %w", err)
-	}
-
-	if clearLease {
-		if err := DeleteLeaseInTx(ctx, tx, id); err != nil {
-			return nil, err
-		}
 	}
 
 	if recordEvent {

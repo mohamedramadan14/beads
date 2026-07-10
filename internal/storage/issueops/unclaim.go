@@ -76,7 +76,7 @@ func UnclaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string, 
 		UPDATE %s
 		SET assignee = '', status = 'open', updated_at = ?,
 		    lease_expires_at = NULL, heartbeat_at = NULL, started_at = NULL,
-		    row_lock = ?
+		    claim_fence = claim_fence + 1, row_lock = ?
 		WHERE id = ? AND status IN ('open', 'in_progress') %s
 	`, issueTable, ownerPredicate), args...)
 	if err != nil {

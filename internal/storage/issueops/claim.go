@@ -18,6 +18,15 @@ type ClaimResult struct {
 	IsWisp   bool
 }
 
+// claimConflictError carries the frozen open-but-assigned conflict message
+// unchanged while unwrapping to storage.ErrAlreadyClaimed, so typed consumers
+// (exit codes, {code:"already_claimed"} JSON) classify the loss without the
+// sentinel's own text prefixing the message.
+type claimConflictError struct{ msg string }
+
+func (e *claimConflictError) Error() string { return e.msg }
+func (e *claimConflictError) Unwrap() error { return storage.ErrAlreadyClaimed }
+
 // ClaimIssueInTx atomically claims an issue using compare-and-swap semantics.
 // It sets the assignee to actor and status to "in_progress" only if the issue
 // is currently open and unassigned or already assigned to the same actor.
@@ -47,7 +56,10 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 	// to conflict rather than silently cell-merge. The claim is an ownership
 	// transition, so it also bumps claim_fence (fenceBumpExpr; row_lock pairing
 	// satisfied by the lease clause in the same statement).
-	leaseClause, leaseArgs := leaseSetClause(now, leaseTTL(ctx))
+	leaseClause, leaseArgs, err := ClaimLeaseClause(ctx, tx, now)
+	if err != nil {
+		return nil, fmt.Errorf("resolve claim lease: %w", err)
+	}
 
 	// Conditional UPDATE: only succeeds while the issue is still claimable.
 	// Also set started_at on first transition to in_progress (GH#2796); preserve
@@ -102,10 +114,12 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		}
 		if assignee != "" && assignee != actor {
 			if currentStatus == types.StatusOpen {
-				// Wrapped in ErrAlreadyClaimed so exit-code/JSON consumers can
-				// classify the loss; the phrasing stays matcher-compatible
-				// ("already claimed" is in the frozen substring set).
-				return nil, fmt.Errorf("%w: assigned to %q. Use `bd unclaim %s` to release it before re-claiming", storage.ErrAlreadyClaimed, assignee, id)
+				// The message text is a frozen contract (downstream substring
+				// matchers and this repo's own tests pin "already assigned
+				// to"); claimConflictError keeps it byte-identical while
+				// wrapping ErrAlreadyClaimed for typed classification.
+				return nil, &claimConflictError{msg: fmt.Sprintf(
+					"issue already assigned to %q. Use `bd unclaim %s` to release it before re-claiming", assignee, id)}
 			}
 			return nil, fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
 		}

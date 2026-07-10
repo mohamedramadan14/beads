@@ -28,6 +28,10 @@ least this long ago are reclaimed, so a worker briefly paused (GC, clock skew)
 is not robbed of live work. Run it from a supervisor on a timer with a window
 of roughly 2× the claim TTL.
 
+On stores with lease.auto=off (see 'bd lease disarm'), claims carry no
+lease unless explicitly requested, so reclaim only ever touches explicitly
+requested leases there.
+
 Examples:
   bd reclaim                       # default grace window (2× the lease TTL)
   bd reclaim --older-than 10m      # reclaim leases expired >10m ago

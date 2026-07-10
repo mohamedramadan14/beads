@@ -88,6 +88,48 @@ func (s *EmbeddedDoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan 
 	return reclaimed, err
 }
 
+// DisarmAutoLeases sets lease.auto=off and NULLs armed leases on existing
+// in_progress rows in both tiers, without releasing them. A bounded
+// follow-up sweep catches claims whose transactions read lease.auto before
+// the flip committed (see DoltStore.DisarmAutoLeases).
+func (s *EmbeddedDoltStore) DisarmAutoLeases(ctx context.Context) (int64, error) {
+	sweep := func(flip bool) (int64, error) {
+		var swept int64
+		err := s.withConn(ctx, true, func(tx *sql.Tx) error {
+			swept = 0
+			if flip {
+				if err := issueops.DisarmLeaseConfigInTx(ctx, tx); err != nil {
+					return err
+				}
+			}
+			for _, table := range []string{"issues", "wisps"} {
+				n, err := issueops.ClearArmedLeasesInTx(ctx, tx, table)
+				if err != nil {
+					return err
+				}
+				swept += n
+			}
+			return nil
+		})
+		return swept, err
+	}
+	total, err := sweep(true)
+	if err != nil {
+		return 0, err
+	}
+	for i := 0; i < 3; i++ {
+		n, err := sweep(false)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			break
+		}
+	}
+	return total, nil
+}
+
 // ReopenIssue reopens a closed issue, setting status to open and clearing
 // closed_at and defer_until. If reason is non-empty, it is recorded as a comment.
 // Wraps UpdateIssue; EmbeddedDolt auto-commits the transaction.

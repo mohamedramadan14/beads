@@ -959,7 +959,8 @@ func allRecognizedConfigPrefixes() []string {
 
 // recognizedConfigKeys lists valid non-namespaced config keys.
 var recognizedConfigKeys = map[string]bool{
-	"no-db": true, "json": true, "db": true, "actor": true,
+	"lease.auto": true, // issueops.LeaseAutoConfigKey — automatic claim-lease stamping (bd lease disarm)
+	"no-db":      true, "json": true, "db": true, "actor": true,
 	"identity": true, "no-push": true, "no-git-ops": true,
 	"create.require-description": true, "beads.role": true,
 	"auto_compact_enabled": true, "schema_version": true,

@@ -29,6 +29,13 @@ var ErrNotClaimable = errors.New("issue not claimable")
 // escape hatch (bd unclaim --force), reserved for admin/reaper use.
 var ErrNotOwner = errors.New("issue claimed by a different actor")
 
+// ErrUnleased is returned when an actor heartbeats its own in_progress claim
+// that carries no lease (lease.auto off, or claimed before the lease stack).
+// Heartbeat is strictly a renewal: arming a lease on a deliberately unleased
+// claim would silently re-create the unrequested reclaim exposure that
+// disarming exists to remove.
+var ErrUnleased = errors.New("issue has no lease")
+
 // ErrPreconditionFailed is the sentinel wrapped by PreconditionFailedError so
 // callers can errors.Is a guarded-write conflict without naming the struct.
 var ErrPreconditionFailed = errors.New("precondition failed")

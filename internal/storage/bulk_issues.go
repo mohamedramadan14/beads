@@ -23,6 +23,13 @@ type BulkIssueStore interface {
 	// than olderThan ago back to ready (clearing the assignee), recovering work
 	// stranded by dead workers. Returns the issues it reclaimed.
 	ReclaimExpiredLeases(ctx context.Context, olderThan time.Duration, actor string) ([]types.ReclaimedLease, error)
+	// DisarmAutoLeases atomically sets lease.auto=off and NULLs the armed
+	// leases on existing in_progress rows (both tiers) without releasing
+	// them, so turning automatic stamping off and removing the existing
+	// reclaim exposure happen in one transaction. Returns the number of rows
+	// disarmed. Explicitly requested leases created afterward (WithLeaseTTL)
+	// remain reclaimable.
+	DisarmAutoLeases(ctx context.Context) (int64, error)
 	PromoteFromEphemeral(ctx context.Context, id string, actor string) error
 	GetNextChildID(ctx context.Context, parentID string) (string, error)
 }

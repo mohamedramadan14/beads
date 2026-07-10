@@ -331,6 +331,64 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 	return reclaimed, nil
 }
 
+// DisarmAutoLeases sets lease.auto=off and NULLs armed leases on existing
+// in_progress rows in both tiers, without releasing them. The flip and the
+// first sweep share one transaction; bounded follow-up sweeps then catch
+// claims whose transactions read lease.auto before the flip committed and
+// stamped a lease the first sweep's snapshot never saw (disjoint rows, so
+// row_lock forces no conflict). Every transaction begun after the flip reads
+// auto=off, so the re-sweep converges within a pass or two.
+func (s *DoltStore) DisarmAutoLeases(ctx context.Context) (int64, error) {
+	disarmTables := []string{"issues", "wisps"}
+	sweep := func(flip bool) (int64, error) {
+		var swept int64
+		err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			swept = 0
+			if flip {
+				if err := issueops.DisarmLeaseConfigInTx(ctx, tx); err != nil {
+					return err
+				}
+			}
+			for _, table := range disarmTables {
+				n, err := issueops.ClearArmedLeasesInTx(ctx, tx, table)
+				if err != nil {
+					return err
+				}
+				swept += n
+			}
+			if !flip && swept == 0 {
+				return nil // nothing to commit on a clean re-sweep
+			}
+			for _, table := range []string{"issues", "wisps", "config"} {
+				_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
+			}
+			commitMsg := fmt.Sprintf("bd: disarm auto-leases (%d in-flight lease(s) cleared)", swept)
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+				return fmt.Errorf("dolt commit: %w", err)
+			}
+			return nil
+		})
+		return swept, err
+	}
+
+	total, err := sweep(true)
+	if err != nil {
+		return 0, err
+	}
+	for i := 0; i < 3; i++ {
+		n, err := sweep(false)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			break
+		}
+	}
+	return total, nil
+}
+
 // UnclaimIssue atomically unclaims an issue by clearing the assignee, resetting
 // status to "open", clearing the lease columns and rewriting row_lock. Records
 // an "unclaimed" event. Only the current assignee may release its own claim

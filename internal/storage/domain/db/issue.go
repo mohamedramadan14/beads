@@ -228,7 +228,10 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 	// server (uow) path leaves lease_expires_at/heartbeat_at NULL and row_lock
 	// unchanged — invisible to bd reclaim and open to the cell-merge bug the
 	// row_lock invariant guards against (see issueops/lease.go).
-	leaseClause, leaseArgs := issueops.LeaseSetClause(now, issueops.LeaseTTL(ctx))
+	leaseClause, leaseArgs, err := issueops.ClaimLeaseClause(ctx, r.runner, now)
+	if err != nil {
+		return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: %w", id, err)
+	}
 
 	var res sql.Result
 	if startedWasZero {

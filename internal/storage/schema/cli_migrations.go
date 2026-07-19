@@ -54,10 +54,10 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// apply the prepared ALTER TABLE statements the runtime migration uses
 		// for idempotent re-runs on upgraded databases.
 		return cliMigration0054AddLeaseColumns
-	case "0055_add_claim_fence.up.sql":
+	case "0056_add_claim_fence.up.sql":
 		// Same direct-DDL treatment as 0054: fresh bundles add the ownership
 		// fence column without the prepared idempotency guards.
-		return cliMigration0055AddClaimFence
+		return cliMigration0056AddClaimFence
 	default:
 		return sqlText
 	}
@@ -85,7 +85,7 @@ ALTER TABLE wisps ADD COLUMN lease_expires_at DATETIME;
 ALTER TABLE wisps ADD COLUMN heartbeat_at DATETIME;
 ALTER TABLE wisps ADD COLUMN row_lock BIGINT NOT NULL DEFAULT 0;`
 
-const cliMigration0055AddClaimFence = `ALTER TABLE issues ADD COLUMN claim_fence BIGINT NOT NULL DEFAULT 0;
+const cliMigration0056AddClaimFence = `ALTER TABLE issues ADD COLUMN claim_fence BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE wisps ADD COLUMN claim_fence BIGINT NOT NULL DEFAULT 0;`
 
 const cliMigration0041SplitDependenciesTarget = `DELETE FROM dolt_nonlocal_tables;

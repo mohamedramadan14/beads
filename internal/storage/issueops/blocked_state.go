@@ -662,30 +662,34 @@ func loadWaitersWhoseSpawnerIsParentOfInTx(
 	}
 	//nolint:gosec // G201: depTable is one of two constant values.
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT depends_on_issue_id, depends_on_wisp_id
+		SELECT %s AS depends_on_id
 		FROM %s
 		WHERE issue_id = ? AND type = 'parent-child'
-	`, depTable), childID)
+	`, DepTargetExpr, depTable), childID)
 	if err != nil {
 		return fmt.Errorf("waiters on parent of %s: load parents: %w", childID, err)
 	}
-	var issueParentIDs, wispParentIDs []string
+	var parentIDs []string
 	for rows.Next() {
-		var ip, wp sql.NullString
-		if err := rows.Scan(&ip, &wp); err != nil {
+		var parentID string
+		if err := rows.Scan(&parentID); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("waiters on parent of %s: scan: %w", childID, err)
 		}
-		if ip.Valid {
-			issueParentIDs = append(issueParentIDs, ip.String)
-		}
-		if wp.Valid {
-			wispParentIDs = append(wispParentIDs, wp.String)
-		}
+		parentIDs = append(parentIDs, parentID)
 	}
 	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("waiters on parent of %s: rows: %w", childID, err)
+	}
+
+	if len(parentIDs) == 0 {
+		return nil
+	}
+
+	wispParentIDs, issueParentIDs, err := PartitionWispIDsInTx(ctx, tx, parentIDs)
+	if err != nil {
+		return fmt.Errorf("waiters on parent of %s: partition parents: %w", childID, err)
 	}
 
 	if len(issueParentIDs) > 0 {

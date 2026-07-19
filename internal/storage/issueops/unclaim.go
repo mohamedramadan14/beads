@@ -157,3 +157,75 @@ func UnclaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string, 
 
 	return nil
 }
+
+// UnclaimIssueIfAssigneeInTx atomically releases a claim only while the issue
+// is still assigned to expectedAssignee. It is the compare-and-swap inverse of
+// ClaimIssueInTx: a stale releaser cannot clobber a claim that has since moved.
+// On success it applies the same transition as UnclaimIssueInTx. When the
+// current assignee differs from expectedAssignee, it returns
+// storage.ErrAssigneeMismatch naming the current holder and leaves the row
+// untouched.
+//
+//nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
+func UnclaimIssueIfAssigneeInTx(ctx context.Context, tx *sql.Tx, id string, actor string, expectedAssignee string) error {
+	if expectedAssignee == "" {
+		return fmt.Errorf("conditional unclaim of %s: expected assignee must not be empty (use UnclaimIssueInTx for an unconditional release)", id)
+	}
+
+	isWisp := IsActiveWispInTx(ctx, tx, id)
+	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
+
+	oldIssue, err := GetIssueInTx(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("failed to get issue for unclaim: %w", err)
+	}
+
+	if oldIssue.Status == types.StatusClosed {
+		return fmt.Errorf("cannot unclaim closed issue %s", id)
+	}
+	if oldIssue.Assignee != expectedAssignee {
+		return fmt.Errorf("%w: %s is held by %q, expected %q", storage.ErrAssigneeMismatch, id, oldIssue.Assignee, expectedAssignee)
+	}
+
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %s
+		SET assignee = '', status = 'open', updated_at = ?,
+		    started_at = NULL, claim_fence = claim_fence + 1, row_lock = ?
+		WHERE id = ? AND status IN ('open', 'in_progress') AND assignee = ?
+	`, issueTable), now, freshRowLock(), id, expectedAssignee)
+	if err != nil {
+		return fmt.Errorf("failed to unclaim issue: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		current, gerr := GetIssueInTx(ctx, tx, id)
+		if gerr != nil {
+			return fmt.Errorf("failed to unclaim issue %s: no matching row", id)
+		}
+		if current.Assignee != expectedAssignee {
+			return fmt.Errorf("%w: %s is held by %q, expected %q", storage.ErrAssigneeMismatch, id, current.Assignee, expectedAssignee)
+		}
+		return fmt.Errorf("failed to unclaim issue %s: no matching row", id)
+	}
+
+	if err := DeleteLeaseInTx(ctx, tx, id); err != nil {
+		return err
+	}
+
+	oldData, _ := json.Marshal(oldIssue)
+	newUpdates := map[string]interface{}{
+		"assignee": "",
+		"status":   "open",
+	}
+	newData, _ := json.Marshal(newUpdates)
+	if err := RecordFullEventInTable(ctx, tx, eventTable, id, "unclaimed", actor, string(oldData), string(newData)); err != nil {
+		return fmt.Errorf("failed to record unclaim event: %w", err)
+	}
+
+	return nil
+}

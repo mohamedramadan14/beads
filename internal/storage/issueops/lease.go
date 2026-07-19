@@ -151,6 +151,69 @@ func LeaseSetClause(now time.Time, ttl time.Duration) (string, []interface{}) {
 	return leaseSetClause(now, ttl)
 }
 
+// DeleteLeaseInTx removes the lease row for an issue, if any. Call from every
+// path that ends or transfers a claim. Deleting a lease that does not exist is
+// a no-op, so callers may invoke it unconditionally.
+func DeleteLeaseInTx(ctx context.Context, tx DBTX, id string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM leases WHERE issue_id = ?`, id); err != nil {
+		return fmt.Errorf("delete lease for %s: %w", id, err)
+	}
+	return nil
+}
+
+// RestoreLeaseOnImportInTx reconciles an issue's lease row after an import or
+// upsert wrote the issue row. It restores a live claim's lease row when the
+// imported snapshot carried one, and drops orphaned local lease rows when the
+// accepted state ended or transferred the claim.
+func RestoreLeaseOnImportInTx(ctx context.Context, tx DBTX, issue *types.Issue, isNew bool) error {
+	now := time.Now().UTC()
+
+	if issue.LeaseExpiresAt != nil {
+		var status, assignee string
+		err := tx.QueryRowContext(ctx,
+			"SELECT status, COALESCE(assignee, '') FROM issues WHERE id = ?", issue.ID,
+		).Scan(&status, &assignee)
+		if err != nil {
+			return fmt.Errorf("read stored row for lease restore of %s: %w", issue.ID, err)
+		}
+		if status == string(types.StatusInProgress) && assignee != "" {
+			grantedAt := now
+			heartbeatAt := now
+			if issue.HeartbeatAt != nil {
+				grantedAt = *issue.HeartbeatAt
+				heartbeatAt = *issue.HeartbeatAt
+			}
+			_, err := tx.ExecContext(ctx, `
+				INSERT INTO leases (issue_id, holder, granted_at, lease_expires_at, heartbeat_at)
+				VALUES (?, ?, ?, ?, ?)
+				ON DUPLICATE KEY UPDATE
+					holder = IF(leases.lease_expires_at >= ?, leases.holder, VALUES(holder)),
+					granted_at = IF(leases.lease_expires_at >= ?, leases.granted_at, VALUES(granted_at)),
+					heartbeat_at = IF(leases.lease_expires_at >= ?, leases.heartbeat_at, VALUES(heartbeat_at)),
+					lease_expires_at = IF(leases.lease_expires_at >= ?, leases.lease_expires_at, VALUES(lease_expires_at))
+			`, issue.ID, assignee, grantedAt, *issue.LeaseExpiresAt, heartbeatAt,
+				now, now, now, now)
+			if err != nil {
+				return fmt.Errorf("restore lease for %s: %w", issue.ID, err)
+			}
+		}
+	}
+
+	if !isNew {
+		_, err := tx.ExecContext(ctx, `
+			DELETE FROM leases WHERE issue_id = ?
+			  AND NOT EXISTS (
+				SELECT 1 FROM issues i
+				WHERE i.id = ? AND i.status = 'in_progress' AND i.assignee = leases.holder
+			  )
+		`, issue.ID, issue.ID)
+		if err != nil {
+			return fmt.Errorf("reconcile lease for %s: %w", issue.ID, err)
+		}
+	}
+	return nil
+}
+
 // LeaseTTL is the exported form of leaseTTL: it resolves the lease TTL for the
 // current claim from the context (WithLeaseTTL) or falls back to
 // DefaultLeaseTTL.

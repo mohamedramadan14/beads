@@ -362,6 +362,95 @@ func TestEnsureWispDependenciesSplitTargetsAddsMissingAndBackfills(t *testing.T)
 	}
 }
 
+func TestEnsureDependenciesSplitTargetsAddsMissingAndBackfills(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
+	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
+	mock.ExpectQuery(tableQuery).WithArgs("dependencies").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	for _, col := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
+		mock.ExpectQuery(columnQuery).WithArgs("dependencies", col).
+			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	}
+	for _, ddl := range []string{
+		"ALTER TABLE dependencies ADD COLUMN depends_on_issue_id VARCHAR\\(255\\) NULL",
+		"ALTER TABLE dependencies ADD COLUMN depends_on_wisp_id VARCHAR\\(255\\) NULL",
+		"ALTER TABLE dependencies ADD COLUMN depends_on_external VARCHAR\\(255\\) NULL",
+	} {
+		mock.ExpectExec(ddl).WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+	mock.ExpectQuery(columnQuery).WithArgs("dependencies", "depends_on_id").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	for _, update := range []string{
+		`UPDATE dependencies SET depends_on_external = depends_on_id`,
+		`UPDATE dependencies d JOIN wisps w ON w\.id = d\.depends_on_id`,
+		`UPDATE dependencies d JOIN issues i ON i\.id = d\.depends_on_id`,
+		`UPDATE dependencies SET depends_on_external = depends_on_id WHERE depends_on_external IS NULL`,
+	} {
+		mock.ExpectExec(update).WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	if err := ensureDependenciesSplitTargets(context.Background(), db); err != nil {
+		t.Fatalf("ensureDependenciesSplitTargets: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+func TestEnsureLeaseColumnsAddsMissingAndBackfills(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
+	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
+	mock.ExpectQuery(tableQuery).WithArgs("issues").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	for _, col := range []string{"lease_expires_at", "heartbeat_at", "row_lock"} {
+		mock.ExpectQuery(columnQuery).WithArgs("issues", col).
+			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		switch col {
+		case "lease_expires_at":
+			mock.ExpectExec("ALTER TABLE issues ADD COLUMN lease_expires_at DATETIME").WillReturnResult(sqlmock.NewResult(0, 0))
+		case "heartbeat_at":
+			mock.ExpectExec("ALTER TABLE issues ADD COLUMN heartbeat_at DATETIME").WillReturnResult(sqlmock.NewResult(0, 0))
+		case "row_lock":
+			mock.ExpectExec("ALTER TABLE issues ADD COLUMN row_lock BIGINT NOT NULL DEFAULT 0").WillReturnResult(sqlmock.NewResult(0, 0))
+		}
+	}
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS idx_issues_lease ON issues \\(status, lease_expires_at\\)").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	mock.ExpectQuery(tableQuery).WithArgs("wisps").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	for _, col := range []string{"lease_expires_at", "heartbeat_at", "row_lock"} {
+		mock.ExpectQuery(columnQuery).WithArgs("wisps", col).
+			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		switch col {
+		case "lease_expires_at":
+			mock.ExpectExec("ALTER TABLE wisps ADD COLUMN lease_expires_at DATETIME").WillReturnResult(sqlmock.NewResult(0, 0))
+		case "heartbeat_at":
+			mock.ExpectExec("ALTER TABLE wisps ADD COLUMN heartbeat_at DATETIME").WillReturnResult(sqlmock.NewResult(0, 0))
+		case "row_lock":
+			mock.ExpectExec("ALTER TABLE wisps ADD COLUMN row_lock BIGINT NOT NULL DEFAULT 0").WillReturnResult(sqlmock.NewResult(0, 0))
+		}
+	}
+
+	if err := ensureLeaseColumns(context.Background(), db); err != nil {
+		t.Fatalf("ensureLeaseColumns: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
 func TestPreMigrationRepairScopedToMain0053(t *testing.T) {
 	// The repair must not fire for other versions or for the ignored source
 	// (whose cursor table differs); nil DB proves no queries are attempted.

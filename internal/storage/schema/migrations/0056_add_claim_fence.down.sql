@@ -1,4 +1,4 @@
--- Documentary rollback for 0055_add_claim_fence. NOTE: down migrations are
+-- Documentary rollback for 0056_add_claim_fence. NOTE: down migrations are
 -- not runtime-applied (the embed is up-only); the operational rollback for
 -- this slice is binary rollback — old binaries tolerate the additive column.
 

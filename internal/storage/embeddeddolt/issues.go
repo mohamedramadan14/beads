@@ -43,6 +43,14 @@ func (s *EmbeddedDoltStore) UnclaimIssue(ctx context.Context, id string, actor s
 	})
 }
 
+// UnclaimIssueIfAssignee atomically releases a claim only while the issue is
+// still assigned to expectedAssignee.
+func (s *EmbeddedDoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string) error {
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		return issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee)
+	})
+}
+
 // UpdateIssue updates fields on an issue.
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
 func (s *EmbeddedDoltStore) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {

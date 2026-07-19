@@ -45,6 +45,11 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 
 	now := time.Now().UTC()
 
+	leaseColumnsPresent, err := hasLeaseCloseColumnsInTx(ctx, tx, issueTable)
+	if err != nil {
+		return nil, fmt.Errorf("check lease columns for %s: %w", id, err)
+	}
+
 	// An ownership guard (--if-assignee/--if-fence) folds into the WHERE so
 	// the check-and-close is one atomic compare-and-swap (see guard.go).
 	guard, hasGuard := GuardFrom(ctx)
@@ -54,14 +59,20 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 	// row_lock) collides on this cell and is forced to conflict-and-retry rather
 	// than silently cell-merging a revert-to-ready over a completed close (see
 	// lease.go). lease_expires_at/heartbeat_at are cleared: a closed issue holds
-	// no lease.
-	args := []interface{}{types.StatusClosed, now, now, reason, session, freshRowLock(), id, types.StatusClosed}
+	// no lease. Older upgraded workspaces may still be missing the lease columns,
+	// so make the lease update conditional rather than failing the close.
+	setClause := "status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?"
+	args := []interface{}{types.StatusClosed, now, now, reason, session}
+	if leaseColumnsPresent {
+		setClause += ", lease_expires_at = NULL, heartbeat_at = NULL, row_lock = ?"
+		args = append(args, freshRowLock())
+	}
+	args = append(args, id, types.StatusClosed)
 	args = append(args, guardArgs...)
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %s SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?,
-			lease_expires_at = NULL, heartbeat_at = NULL, row_lock = ?
+		UPDATE %s SET %s
 		WHERE id = ? AND status != ?%s
-	`, issueTable, guardClause), args...)
+	`, issueTable, setClause, guardClause), args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to close issue: %w", err)
 	}
@@ -116,4 +127,23 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 	}
 
 	return &CloseResult{IsWisp: isWisp}, nil
+}
+
+func hasLeaseCloseColumnsInTx(ctx context.Context, tx DBTX, table string) (bool, error) {
+	for _, column := range []string{"lease_expires_at", "heartbeat_at", "row_lock"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = ?
+			  AND COLUMN_NAME = ?
+		`, table, column).Scan(&count); err != nil {
+			return false, err
+		}
+		if count == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }

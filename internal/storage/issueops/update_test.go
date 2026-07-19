@@ -1,6 +1,7 @@
 package issueops
 
 import (
+	"context"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -80,8 +81,18 @@ func TestManageLeaseOnUpdate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			oldIssue := &types.Issue{Status: tt.oldStatus, Assignee: tt.oldOwner}
 
-			if cleared := ManageLeaseOnUpdate(oldIssue, tt.updates); cleared != tt.wantClear {
-				t.Errorf("clear = %v, want %v", cleared, tt.wantClear)
+			setClauses, _ := ManageLeaseOnUpdate(oldIssue, tt.updates, nil, nil, context.Background())
+			gotClear := len(setClauses) > 0
+			if gotClear != tt.wantClear {
+				t.Fatalf("clear = %v, want %v", gotClear, tt.wantClear)
+			}
+			if gotClear {
+				if len(setClauses) != 2 {
+					t.Fatalf("clear clauses = %v, want exactly 2 lease-clearing clauses", setClauses)
+				}
+				if setClauses[0] != "lease_expires_at = NULL" || setClauses[1] != "heartbeat_at = NULL" {
+					t.Fatalf("clear clauses = %v, want lease column clears", setClauses)
+				}
 			}
 		})
 	}

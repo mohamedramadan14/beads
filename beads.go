@@ -58,6 +58,12 @@ type CloseIssueOptions = storage.CloseIssueOptions
 // is true when the issue was already closed (idempotent no-op).
 type CloseIssueResult = storage.CloseIssueResult
 
+// UpdateIssueOptions carries the optional inputs to Storage.UpdateIssueChecked —
+// an update with an optional ExpectedVersion compare-and-swap that refuses a
+// concurrently-modified issue with ErrVersionMismatch. Exported so consumers can
+// name it without importing internal/storage.
+type UpdateIssueOptions = storage.UpdateIssueOptions
+
 // RemoteStore provides dolt remote management and replication operations.
 // Use type assertion on a Storage value to access these methods:
 //

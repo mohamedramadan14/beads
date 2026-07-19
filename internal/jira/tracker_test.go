@@ -650,6 +650,9 @@ func (s *configStore) GetIssuesByIDs(_ context.Context, _ []string) ([]*types.Is
 func (s *configStore) UpdateIssue(_ context.Context, _ string, _ map[string]interface{}, _ string) error {
 	return nil
 }
+func (s *configStore) UpdateIssueChecked(_ context.Context, _ string, _ map[string]interface{}, _ string, _ storage.UpdateIssueOptions) error {
+	return nil
+}
 func (s *configStore) ReopenIssue(_ context.Context, _, _, _ string) error     { return nil }
 func (s *configStore) UpdateIssueType(_ context.Context, _, _, _ string) error { return nil }
 func (s *configStore) CloseIssue(_ context.Context, _, _, _, _ string) error   { return nil }

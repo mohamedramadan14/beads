@@ -116,6 +116,17 @@ func (h *HookFiringStore) UpdateIssue(ctx context.Context, id string, updates ma
 	return nil
 }
 
+// UpdateIssueChecked applies the guarded update (optional ExpectedVersion CAS)
+// and fires on_update on success — mirroring UpdateIssue. A version mismatch
+// (ErrVersionMismatch) or any other error returns without firing.
+func (h *HookFiringStore) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts UpdateIssueOptions) error {
+	if err := h.inner.UpdateIssueChecked(ctx, id, updates, actor, opts); err != nil {
+		return err
+	}
+	h.fireHookByID(ctx, hooks.EventUpdate, id)
+	return nil
+}
+
 // ReopenIssue reopens an issue and fires on_update.
 func (h *HookFiringStore) ReopenIssue(ctx context.Context, id string, reason string, actor string) error {
 	if err := h.inner.ReopenIssue(ctx, id, reason, actor); err != nil {
@@ -566,6 +577,9 @@ var (
 	} = (*HookFiringStore)(nil)
 	_ interface {
 		UpdateIssue(context.Context, string, map[string]interface{}, string) error
+	} = (*HookFiringStore)(nil)
+	_ interface {
+		UpdateIssueChecked(context.Context, string, map[string]interface{}, string, UpdateIssueOptions) error
 	} = (*HookFiringStore)(nil)
 	_ interface {
 		CloseIssue(context.Context, string, string, string, string) error

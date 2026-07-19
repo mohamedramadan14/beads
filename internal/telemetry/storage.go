@@ -153,6 +153,18 @@ func (s *InstrumentedStorage) UpdateIssue(ctx context.Context, id string, update
 	return err
 }
 
+func (s *InstrumentedStorage) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts storage.UpdateIssueOptions) error {
+	attrs := []attribute.KeyValue{
+		attribute.String("bd.issue.id", id),
+		attribute.String("bd.actor", actor),
+		attribute.Int("bd.update.count", len(updates)),
+	}
+	ctx, span, t := s.op(ctx, "UpdateIssueChecked", attrs...)
+	err := s.inner.UpdateIssueChecked(ctx, id, updates, actor, opts)
+	s.done(ctx, span, t, err, attrs...)
+	return err
+}
+
 func (s *InstrumentedStorage) ReopenIssue(ctx context.Context, id string, reason string, actor string) error {
 	attrs := []attribute.KeyValue{
 		attribute.String("bd.issue.id", id),

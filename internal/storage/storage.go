@@ -67,6 +67,10 @@ type Storage interface {
 	GetIssueByExternalRef(ctx context.Context, externalRef string) (*types.Issue, error)
 	GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error)
 	UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error
+	// UpdateIssueChecked applies the update like UpdateIssue, with an optional
+	// optimistic-concurrency precondition: see UpdateIssueOptions.ExpectedVersion.
+	// The version read and the update share one transaction (a true CAS).
+	UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts UpdateIssueOptions) error
 	ReopenIssue(ctx context.Context, id string, reason string, actor string) error
 	UnclaimIssue(ctx context.Context, id string, actor string, force bool) error
 	// UnclaimIssueIfAssignee releases a claim only while the issue is still
@@ -240,6 +244,16 @@ type CloseIssueOptions struct {
 // CloseIssueResult reports the outcome of CloseIssueChecked.
 type CloseIssueResult struct {
 	Unchanged bool // true when the issue was ALREADY closed (idempotent no-op)
+}
+
+// UpdateIssueOptions carries the optional inputs to UpdateIssueChecked.
+type UpdateIssueOptions struct {
+	// ExpectedVersion, when non-nil, makes the update a compare-and-swap: it
+	// proceeds only if the issue's current RowVersion (row_lock) equals
+	// *ExpectedVersion, else it refuses with ErrVersionMismatch atomically.
+	// nil disables the check. A pointer so nil is distinct from requiring a
+	// legacy version of 0.
+	ExpectedVersion *int64
 }
 
 // MergeSlotStatus is returned by MergeSlotCheck and describes the current

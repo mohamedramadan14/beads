@@ -74,6 +74,38 @@ func (s *EmbeddedDoltStore) UpdateIssue(ctx context.Context, id string, updates 
 	})
 }
 
+// UpdateIssueChecked applies the update like UpdateIssue, adding an optional
+// optimistic-concurrency precondition: when opts.ExpectedVersion is non-nil the
+// update proceeds only if the issue's current RowVersion (row_lock) still equals
+// *opts.ExpectedVersion, else it refuses with storage.ErrVersionMismatch. The
+// version read and the update share ONE transaction, so a mismatch returns
+// before any write and the transaction rolls back with the issue unchanged (a
+// true compare-and-swap). nil disables the check, leaving behavior identical to
+// UpdateIssue. Delegates SQL work to issueops; EmbeddedDolt auto-commits the
+// transaction.
+func (s *EmbeddedDoltStore) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts storage.UpdateIssueOptions) error {
+	// Validate metadata against schema before routing.
+	if rawMeta, ok := updates["metadata"]; ok {
+		metadataStr, err := storage.NormalizeMetadataValue(rawMeta)
+		if err != nil {
+			return fmt.Errorf("invalid metadata: %w", err)
+		}
+		if err := issueops.ValidateMetadataIfConfigured(json.RawMessage(metadataStr)); err != nil {
+			return err
+		}
+	}
+
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		if opts.ExpectedVersion != nil {
+			if err := issueops.CheckVersionInTx(ctx, tx, id, *opts.ExpectedVersion); err != nil {
+				return err
+			}
+		}
+		_, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor)
+		return err
+	})
+}
+
 // HeartbeatIssue refreshes the lease on an issue actor holds in_progress.
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
 func (s *EmbeddedDoltStore) HeartbeatIssue(ctx context.Context, id, actor string) error {

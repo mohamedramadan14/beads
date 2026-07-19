@@ -44,6 +44,24 @@ func TestReExportVersionMismatch(t *testing.T) {
 	}
 }
 
+// TestUpdateIssueOptionsIsExported proves the public beads.UpdateIssueOptions
+// alias is usable from outside the module and its ExpectedVersion compare-and-
+// swap field round-trips — the type a caller names to opt a
+// Storage.UpdateIssueChecked into optimistic concurrency without importing
+// internal/storage. The zero value must leave ExpectedVersion nil (no check).
+func TestUpdateIssueOptionsIsExported(t *testing.T) {
+	t.Parallel()
+
+	v := int64(7)
+	opts := beads.UpdateIssueOptions{ExpectedVersion: &v}
+	if opts.ExpectedVersion == nil || *opts.ExpectedVersion != 7 {
+		t.Fatalf("ExpectedVersion did not round-trip through the exported alias: %+v", opts)
+	}
+	if (beads.UpdateIssueOptions{}).ExpectedVersion != nil {
+		t.Fatal("zero-value UpdateIssueOptions must have a nil ExpectedVersion (no check)")
+	}
+}
+
 // TestReExportedSentinelIdentity proves each public sentinel is the SAME value
 // as the internal one it aliases, so errors.Is composes across the package
 // boundary without any bridging.

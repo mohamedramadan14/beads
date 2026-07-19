@@ -199,6 +199,33 @@ func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[strin
 	return wrapTransactionError("commit update wisp", tx.Commit())
 }
 
+// updateWispChecked updates a wisp with an optional atomic version precondition,
+// mirroring updateWisp but — when expectedVersion is non-nil — first calling
+// issueops.CheckVersionInTx in the SAME transaction, so a stale version refuses
+// with storage.ErrVersionMismatch before any write and the deferred Rollback
+// discards the transaction (a true compare-and-swap). Like updateWisp it uses a
+// bare BeginTx/Commit with no withRetryTx (consistent with the rest of the wisp
+// write path — do not add one here); wisps live in dolt_ignored tables, so there
+// is no DOLT_COMMIT.
+func (s *DoltStore) updateWispChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, expectedVersion *int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if expectedVersion != nil {
+		if err := issueops.CheckVersionInTx(ctx, tx, id, *expectedVersion); err != nil {
+			return err
+		}
+	}
+	if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
+		return err
+	}
+
+	return wrapTransactionError("commit update wisp", tx.Commit())
+}
+
 // closeWisp closes a wisp in the wisps table.
 // Delegates SQL work to issueops.CloseIssueInTx; no Dolt versioning needed
 // since wisps live in dolt_ignored tables.

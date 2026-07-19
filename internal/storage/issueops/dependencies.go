@@ -242,6 +242,18 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	}
 
 	srcIsWisp := writeTable == "wisp_dependencies"
+
+	// Record the dependency_added event on the source issue's event table so the
+	// bd CLI and library callers observing an issue's history see the new edge.
+	// The source's event table routes the same way as its dependency write table
+	// (wisp_dependencies -> wisp_events). This runs only on the genuine new-edge
+	// path: the idempotent same-type re-add returned earlier without emitting.
+	_, _, eventTable, _ := WispTableRouting(srcIsWisp)
+	if err := RecordEventInTable(ctx, tx, eventTable, dep.IssueID, types.EventDependencyAdded, actor,
+		fmt.Sprintf("Added dependency: %s %s %s", dep.IssueID, dep.Type, dep.DependsOnID)); err != nil {
+		return fmt.Errorf("record dependency_added event: %w", err)
+	}
+
 	var affectedIssues, affectedWisps []string
 	var aerr error
 	if srcIsWisp {
@@ -828,12 +840,14 @@ func checkRenameTargetCollision(ctx context.Context, tx *sql.Tx, table, typedCol
 
 // RemoveDependencyInTx removes a dependency between two issues within an
 // existing transaction. Automatically routes to wisp_dependencies if the
-// source issue is an active wisp.
+// source issue is an active wisp. When a row is actually removed it records a
+// dependency_removed event (attributed to actor) on the source's event table;
+// a no-op remove of a missing edge records nothing.
 //
 //nolint:gosec // G201: depTable from WispTableRouting (hardcoded constants)
-func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID string) error {
+func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID, actor string) error {
 	isWisp := IsActiveWispInTx(ctx, tx, issueID)
-	_, _, _, depTable := WispTableRouting(isWisp)
+	_, _, eventTable, depTable := WispTableRouting(isWisp)
 
 	// Capture the row's type before deleting so we can dispatch the right
 	// affected-set helper. If no row matches, treat as a no-op.
@@ -852,6 +866,14 @@ func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID 
 		`DELETE FROM %s WHERE issue_id = ? AND %s = ?`, depTable, DepTargetExpr),
 		issueID, dependsOnID); err != nil {
 		return fmt.Errorf("remove dependency: %w", err)
+	}
+
+	// The lookup above returned early when no row matched, so reaching here means
+	// an edge was actually deleted — record the dependency_removed event on the
+	// source issue's event table for bd CLI / library history observers.
+	if err := RecordEventInTable(ctx, tx, eventTable, issueID, types.EventDependencyRemoved, actor,
+		fmt.Sprintf("Removed dependency on %s", dependsOnID)); err != nil {
+		return fmt.Errorf("record dependency_removed event: %w", err)
 	}
 
 	var affectedIssues, affectedWisps []string

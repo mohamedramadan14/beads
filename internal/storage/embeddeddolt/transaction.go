@@ -110,7 +110,7 @@ func (t *embeddedTransaction) AddDependency(ctx context.Context, dep *types.Depe
 }
 
 func (t *embeddedTransaction) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, addOpts storage.DependencyAddOptions) error {
-	_, _, _, depTable := issueops.WispTableRouting(issueops.IsActiveWispInTx(ctx, t.tx, dep.IssueID))
+	_, _, eventTable, depTable := issueops.WispTableRouting(issueops.IsActiveWispInTx(ctx, t.tx, dep.IssueID))
 	if err := issueops.AddDependencyInTx(ctx, t.tx, dep, actor, issueops.AddDependencyOpts{
 		IsCrossPrefix:  types.ExtractPrefix(dep.IssueID) != types.ExtractPrefix(dep.DependsOnID),
 		SkipCycleCheck: addOpts.SkipCycleCheck,
@@ -118,6 +118,9 @@ func (t *embeddedTransaction) AddDependencyWithOptions(ctx context.Context, dep 
 		return err
 	}
 	t.dirty.MarkDirty(depTable)
+	// AddDependencyInTx records a dependency_added event on the source's event
+	// table; stage it so the event commits with the edge.
+	t.dirty.MarkDirty(eventTable)
 	return nil
 }
 
@@ -133,8 +136,14 @@ func (t *embeddedTransaction) CycleThroughEdges(ctx context.Context, edges [][2]
 }
 
 func (t *embeddedTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
-	t.dirty.MarkDirty("dependencies")
-	return issueops.RemoveDependencyInTx(ctx, t.tx, issueID, dependsOnID)
+	// Route dirty marking on the source's wisp status: a wisp-source remove
+	// stages wisp_dependencies/wisp_events, a permanent one dependencies/events.
+	// RemoveDependencyInTx records a dependency_removed event on the source's
+	// event table when a row is deleted; stage it so it commits with the edge.
+	_, _, eventTable, depTable := issueops.WispTableRouting(issueops.IsActiveWispInTx(ctx, t.tx, issueID))
+	t.dirty.MarkDirty(depTable)
+	t.dirty.MarkDirty(eventTable)
+	return issueops.RemoveDependencyInTx(ctx, t.tx, issueID, dependsOnID, actor)
 }
 
 func (t *embeddedTransaction) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {

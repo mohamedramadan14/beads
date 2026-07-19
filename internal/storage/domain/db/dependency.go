@@ -18,11 +18,15 @@ import (
 )
 
 func NewDependencySQLRepository(runner Runner) domain.DependencySQLRepository {
-	return &dependencySQLRepositoryImpl{runner: runner}
+	return &dependencySQLRepositoryImpl{
+		runner: runner,
+		events: NewEventsSQLRepository(runner),
+	}
 }
 
 type dependencySQLRepositoryImpl struct {
 	runner Runner
+	events domain.EventsSQLRepository
 }
 
 var _ domain.DependencySQLRepository = (*dependencySQLRepositoryImpl)(nil)
@@ -139,6 +143,24 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
 	}
 
+	// Record the dependency_added event on the source's event table, matching the
+	// embedded/issueops AddDependencyInTx path so the bd CLI and library callers
+	// observe the same history from either write plumbing. Reached only on the
+	// genuine new-edge path; the idempotent same-type refresh returned earlier.
+	// Gated on EmitEvent so only the explicit dep verbs emit: create-with-deps
+	// calls Insert directly without it, so an implicit parent-child / --deps /
+	// waits-for edge produces no event (parity with embedded PersistDependencies).
+	if opts.EmitEvent {
+		if err := r.events.Record(ctx, domain.Event{
+			IssueID:  dep.IssueID,
+			Type:     types.EventDependencyAdded,
+			Actor:    actor,
+			NewValue: fmt.Sprintf("Added dependency: %s %s %s", dep.IssueID, dep.Type, dep.DependsOnID),
+		}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
+			return fmt.Errorf("db: DependencySQLRepository.Insert: record dependency_added event: %w", err)
+		}
+	}
+
 	// is_blocked maintenance mirrors the classic AddDependencyInTx flow
 	// (issueops/dependencies.go): the affected set expands the source by its
 	// parent-child descendants (plus, for parent-child edges, waiters on the
@@ -248,6 +270,21 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 		issueID, dependsOnID,
 	); err != nil {
 		return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: %s -> %s: %w", issueID, dependsOnID, err)
+	}
+
+	// The type lookup above returned Found:false when no edge existed, so reaching
+	// here means a row was deleted — record the dependency_removed event on the
+	// source's event table, matching the embedded/issueops RemoveDependencyInTx path.
+	// Gated on EmitEvent so only the explicit `bd dep remove` verb emits.
+	if opts.EmitEvent {
+		if err := r.events.Record(ctx, domain.Event{
+			IssueID:  issueID,
+			Type:     types.EventDependencyRemoved,
+			Actor:    actor,
+			NewValue: fmt.Sprintf("Removed dependency on %s", dependsOnID),
+		}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
+			return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: record dependency_removed event: %w", err)
+		}
 	}
 
 	dt := types.DependencyType(depType)

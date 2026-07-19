@@ -699,9 +699,11 @@ func (t *doltTransaction) AddDependency(ctx context.Context, dep *types.Dependen
 func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, addOpts storage.DependencyAddOptions) error {
 	table := "dependencies"
 	sourceTable := "issues"
+	eventTable := "events"
 	if t.isActiveWisp(ctx, dep.IssueID) {
 		table = "wisp_dependencies"
 		sourceTable = "wisps"
+		eventTable = "wisp_events"
 	}
 
 	isCrossPrefix := isCrossPrefixDep(dep.IssueID, dep.DependsOnID)
@@ -766,6 +768,10 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 		return addErr
 	}
 	t.dirty.MarkDirty(table)
+	// AddDependencyInTx records a dependency_added event on the source's event
+	// table; stage it so StageAndCommit commits the event with the edge (a torn
+	// write otherwise leaves the event in the working set, dropped on reset).
+	t.dirty.MarkDirty(eventTable)
 	t.recordDepTierWrite(table)
 	return nil
 }
@@ -907,13 +913,18 @@ func (t *doltTransaction) GetDependencyRecords(ctx context.Context, issueID stri
 
 func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	table := "dependencies"
+	eventTable := "events"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_dependencies"
+		eventTable = "wisp_events"
 	}
-	if err := issueops.RemoveDependencyInTx(ctx, t.txFor(table), issueID, dependsOnID); err != nil {
+	if err := issueops.RemoveDependencyInTx(ctx, t.txFor(table), issueID, dependsOnID, actor); err != nil {
 		return wrapExecError("remove dependency in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	// RemoveDependencyInTx records a dependency_removed event on the source's
+	// event table when a row is deleted; stage it so it commits with the edge.
+	t.dirty.MarkDirty(eventTable)
 	return nil
 }
 

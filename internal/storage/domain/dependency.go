@@ -67,6 +67,13 @@ type DepInsertOpts struct {
 	UseWispsTable      bool
 	HierarchyValidated bool // Set only after ValidateBlockingHierarchy on the same repository/UOW.
 	CycleValidated     bool // Set only after HasCycle or a whole-graph check on the same repository/UOW.
+	// EmitEvent records a dependency_added / dependency_removed event on the
+	// source's event table for a genuine edge add/remove. Only the explicit dep
+	// verbs (AddDependency/AddDependencies/RemoveDependency and their wisp twins)
+	// set it; create-with-deps calls Insert directly with it unset so an implicit
+	// parent-child / --deps / waits-for edge produces no event, matching the
+	// embedded plumbing (issueops PersistDependencies emits nothing on create).
+	EmitEvent bool
 }
 
 type DepListOpts struct {
@@ -226,7 +233,7 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 		}
 	}
 
-	if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp, HierarchyValidated: true, CycleValidated: true}); err != nil {
+	if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp, HierarchyValidated: true, CycleValidated: true, EmitEvent: true}); err != nil {
 		// The retype conflict is a user-facing error whose message already
 		// matches embedded verbatim; pass it through unwrapped so the CLI does
 		// not prepend "add dep: insert:" (#4547 F-1).
@@ -255,7 +262,7 @@ func (u *dependencyUseCaseImpl) removeDep(ctx context.Context, sourceID, depends
 	if sourceID == "" || dependsOnID == "" {
 		return fmt.Errorf("remove dep: sourceID and dependsOnID must not be empty")
 	}
-	if _, err := u.depRepo.Delete(ctx, sourceID, dependsOnID, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
+	if _, err := u.depRepo.Delete(ctx, sourceID, dependsOnID, actor, DepInsertOpts{UseWispsTable: useWisp, EmitEvent: true}); err != nil {
 		return fmt.Errorf("remove dep %s -> %s: %w", sourceID, dependsOnID, err)
 	}
 	return nil
@@ -527,7 +534,11 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 	if len(deps) == 0 {
 		return BulkAddDepsResult{Added: []*types.Dependency{}}, nil
 	}
-	insertOpts := DepInsertOpts{UseWispsTable: useWisp, HierarchyValidated: true, CycleValidated: true}
+	// AddDependencies is the explicit `bd dep add` / `bd link` verb on the
+	// proxied server (cmd/bd/dep_proxied_server.go, link_proxied_server.go), so
+	// each genuine new edge records a dependency_added event — unlike
+	// create-with-deps, which calls depRepo.Insert directly without EmitEvent.
+	insertOpts := DepInsertOpts{UseWispsTable: useWisp, HierarchyValidated: true, CycleValidated: true, EmitEvent: true}
 	// Validate the entire input shape before the first write. Multi-edge callers
 	// run in a UOW, but this also avoids an avoidable partial prefix for direct
 	// use-case consumers.

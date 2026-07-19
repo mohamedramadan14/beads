@@ -21,7 +21,7 @@ func (s *EmbeddedDoltStore) AddDependency(ctx context.Context, dep *types.Depend
 // RemoveDependency removes a dependency between two issues.
 func (s *EmbeddedDoltStore) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.RemoveDependencyInTx(ctx, tx, issueID, dependsOnID)
+		return issueops.RemoveDependencyInTx(ctx, tx, issueID, dependsOnID, actor)
 	})
 }
 

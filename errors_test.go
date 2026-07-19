@@ -28,6 +28,22 @@ func TestReExportCloseBlocked(t *testing.T) {
 	}
 }
 
+// TestReExportVersionMismatch proves the public beads.ErrVersionMismatch alias
+// is the same value as the internal sentinel and composes through errors.Is when
+// wrapped — the property a CloseIssueChecked caller relies on to detect an
+// optimistic-concurrency refusal without importing internal/storage.
+func TestReExportVersionMismatch(t *testing.T) {
+	t.Parallel()
+
+	if beads.ErrVersionMismatch != storage.ErrVersionMismatch {
+		t.Error("beads.ErrVersionMismatch is not the internal sentinel value (identity broken)")
+	}
+	wrapped := fmt.Errorf("x: %w", beads.ErrVersionMismatch)
+	if !errors.Is(wrapped, beads.ErrVersionMismatch) {
+		t.Errorf("errors.Is(wrapped, beads.ErrVersionMismatch) = false; err = %v", wrapped)
+	}
+}
+
 // TestReExportedSentinelIdentity proves each public sentinel is the SAME value
 // as the internal one it aliases, so errors.Is composes across the package
 // boundary without any bridging.
@@ -42,6 +58,7 @@ func TestReExportedSentinelIdentity(t *testing.T) {
 		{"ErrNotFound", beads.ErrNotFound, storage.ErrNotFound},
 		{"ErrAlreadyClaimed", beads.ErrAlreadyClaimed, storage.ErrAlreadyClaimed},
 		{"ErrNotClaimable", beads.ErrNotClaimable, storage.ErrNotClaimable},
+		{"ErrVersionMismatch", beads.ErrVersionMismatch, storage.ErrVersionMismatch},
 		{"ErrSelfDependency", beads.ErrSelfDependency, domain.ErrSelfDependency},
 		{"ErrDependencyCycle", beads.ErrDependencyCycle, domain.ErrDependencyCycle},
 		{"ErrFieldTooLong", beads.ErrFieldTooLong, types.ErrFieldTooLong},

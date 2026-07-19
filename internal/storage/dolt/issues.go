@@ -437,9 +437,12 @@ func (s *DoltStore) CloseIssue(ctx context.Context, id string, reason string, ac
 }
 
 // CloseIssueChecked closes an issue but refuses with storage.ErrCloseBlocked
-// when it is still blocked (is_blocked=1) unless opts.Force is set. The guard
-// and the close share one transaction, so the check is atomic (no TOCTOU).
-// Mirrors CloseIssue's Dolt-specific concerns (wisp routing, DOLT_ADD/COMMIT).
+// when it is still blocked (is_blocked=1) unless opts.Force is set, and — when
+// opts.ExpectedVersion is non-nil — with storage.ErrVersionMismatch when the
+// row's current RowVersion no longer matches (an orthogonal CAS that Force does
+// not bypass). Both checks and the close share one transaction, so they are
+// atomic (no TOCTOU). Mirrors CloseIssue's Dolt-specific concerns (wisp routing,
+// DOLT_ADD/COMMIT).
 func (s *DoltStore) CloseIssueChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
 	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
@@ -455,7 +458,7 @@ func (s *DoltStore) CloseIssueChecked(ctx context.Context, id string, actor stri
 	// event are written (the atomic-refuse property).
 	var result storage.CloseIssueResult
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force)
+		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion)
 		if err != nil {
 			return err
 		}

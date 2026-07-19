@@ -134,13 +134,16 @@ func (s *EmbeddedDoltStore) CloseIssue(ctx context.Context, id string, reason st
 }
 
 // CloseIssueChecked closes an issue but refuses with storage.ErrCloseBlocked
-// when it is still blocked (is_blocked=1) unless opts.Force is set. The guard
-// and the close share one transaction, so the check is atomic (no TOCTOU).
-// Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
+// when it is still blocked (is_blocked=1) unless opts.Force is set, and — when
+// opts.ExpectedVersion is non-nil — with storage.ErrVersionMismatch when the
+// row's current RowVersion no longer matches (an orthogonal CAS that Force does
+// not bypass). Both checks and the close share one transaction, so they are
+// atomic (no TOCTOU). Delegates SQL work to issueops; EmbeddedDolt auto-commits
+// the transaction.
 func (s *EmbeddedDoltStore) CloseIssueChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
 	var result storage.CloseIssueResult
 	err := s.withConn(ctx, true, func(tx *sql.Tx) error {
-		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force)
+		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion)
 		if err != nil {
 			return err
 		}

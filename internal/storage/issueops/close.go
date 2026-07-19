@@ -31,7 +31,20 @@ func CloseIssueWithoutEventInTx(ctx context.Context, tx DBTX, id string, reason,
 // storage.ErrCloseBlocked when it is still blocked (is_blocked=1) unless force
 // is set. The guard (IsBlockedInTx) and the close (CloseIssueInTx) share the
 // SAME transaction, so no blocker can clear between the check and the close.
-func CloseIssueCheckedInTx(ctx context.Context, tx DBTX, id, reason, actor, session string, force bool) (*CloseResult, error) {
+//
+// When expectedVersion is non-nil it adds an ORTHOGONAL optimistic-concurrency
+// precondition: the row's current RowVersion (row_lock) must still equal
+// *expectedVersion or the close refuses with storage.ErrVersionMismatch. This
+// runs first — before the is_blocked guard and before force short-circuits it —
+// so force bypasses only the is_blocked guard, never the version check. Because
+// the read shares this transaction, a mismatch returns before any write and the
+// transaction rolls back with the issue unchanged (a true compare-and-swap).
+func CloseIssueCheckedInTx(ctx context.Context, tx DBTX, id, reason, actor, session string, force bool, expectedVersion *int64) (*CloseResult, error) {
+	if expectedVersion != nil {
+		if err := CheckVersionInTx(ctx, tx, id, *expectedVersion); err != nil {
+			return nil, err
+		}
+	}
 	if !force {
 		blocked, blockers, err := IsBlockedInTx(ctx, tx, id)
 		if err != nil {

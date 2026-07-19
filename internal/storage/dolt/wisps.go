@@ -218,10 +218,20 @@ func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, act
 
 // closeWispChecked closes a wisp with the is_blocked guard, mirroring closeWisp
 // but refusing with storage.ErrCloseBlocked when the wisp is still blocked
-// unless opts.Force is set. The guard and the close share the same transaction;
-// wisps live in dolt_ignored tables, so there is no DOLT_COMMIT. On a guard
-// rejection the deferred Rollback discards the transaction — no close or event
-// is written.
+// unless opts.Force is set — and, when opts.ExpectedVersion is non-nil, with
+// storage.ErrVersionMismatch when the row's RowVersion no longer matches (an
+// orthogonal CAS that Force does not bypass). The checks and the close share the
+// same transaction; wisps live in dolt_ignored tables, so there is no
+// DOLT_COMMIT. On any rejection the deferred Rollback discards the transaction —
+// no close or event is written.
+//
+// Unlike the permanent path, the wisp close uses a bare BeginTx/Commit with no
+// withRetryTx (consistent with the rest of the wisp write path — do not add one
+// here). So the CAS's read-side limb still returns ErrVersionMismatch for a
+// writer that committed before this tx began, but a CONCURRENT wisp mutation
+// that loses the race at commit surfaces as a transaction/serialization error
+// rather than ErrVersionMismatch. Either way atomicity holds: no lost update and
+// no stale close.
 func (s *DoltStore) closeWispChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -229,7 +239,7 @@ func (s *DoltStore) closeWispChecked(ctx context.Context, id string, actor strin
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force)
+	res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion)
 	if err != nil {
 		return storage.CloseIssueResult{}, err
 	}

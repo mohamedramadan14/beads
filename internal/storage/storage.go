@@ -50,6 +50,12 @@ var ErrPrefixMismatch = errors.New("prefix mismatch")
 // or an open blocking gate). Bypass with CloseIssueOptions.Force.
 var ErrCloseBlocked = errors.New("cannot close blocked issue")
 
+// ErrVersionMismatch is returned by a *Checked op given an ExpectedVersion that
+// no longer matches the row's current version (row_lock) — an optimistic
+// concurrency failure. Callers errors.Is it to distinguish a lost-update
+// precondition from other errors.
+var ErrVersionMismatch = errors.New("version mismatch")
+
 // Storage is the interface satisfied by *dolt.DoltStore.
 // Consumers depend on this interface rather than on the concrete type so that
 // alternative implementations (mocks, proxies, etc.) can be substituted.
@@ -73,8 +79,12 @@ type Storage interface {
 	// CloseIssueChecked closes an issue, but refuses with ErrCloseBlocked when
 	// the issue is still blocked (is_blocked=1) unless opts.Force is set. The
 	// blocked-check and the close run in ONE transaction, so the guard is atomic
-	// (no TOCTOU). Already-closed is an idempotent success with Unchanged=true; a
-	// missing issue returns ErrNotFound.
+	// (no TOCTOU). When opts.ExpectedVersion is non-nil it adds an orthogonal
+	// optimistic-concurrency precondition: the close proceeds only if the issue's
+	// current RowVersion still equals *opts.ExpectedVersion, else it refuses with
+	// ErrVersionMismatch atomically (Force does NOT bypass this check). Already-
+	// closed is an idempotent success with Unchanged=true; a missing issue returns
+	// ErrNotFound.
 	CloseIssueChecked(ctx context.Context, id string, actor string, opts CloseIssueOptions) (CloseIssueResult, error)
 	DeleteIssue(ctx context.Context, id string) error
 	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
@@ -213,6 +223,15 @@ type CloseIssueOptions struct {
 	Reason  string
 	Session string
 	Force   bool // bypass the is_blocked guard (mirrors `bd close --force`)
+	// ExpectedVersion, when non-nil, gates the close on an optimistic-concurrency
+	// check: the close proceeds only if the issue's current RowVersion (the
+	// row_lock token) equals *ExpectedVersion, otherwise it refuses with
+	// ErrVersionMismatch atomically (the version read and the close share one
+	// transaction). nil disables the check, leaving behavior unchanged. It is a
+	// pointer, not an int64, so nil ("no check") is distinct from a caller that
+	// requires version 0. Force bypasses only the is_blocked guard, not this
+	// version check.
+	ExpectedVersion *int64
 }
 
 // CloseIssueResult reports the outcome of CloseIssueChecked.

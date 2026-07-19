@@ -220,6 +220,7 @@ var (
 	ErrAlreadyClaimed  = storage.ErrAlreadyClaimed
 	ErrNotClaimable    = storage.ErrNotClaimable
 	ErrCloseBlocked    = storage.ErrCloseBlocked
+	ErrVersionMismatch = storage.ErrVersionMismatch
 	ErrSelfDependency  = domain.ErrSelfDependency
 	ErrDependencyCycle = domain.ErrDependencyCycle
 	ErrFieldTooLong    = types.ErrFieldTooLong

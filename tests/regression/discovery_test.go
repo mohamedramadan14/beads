@@ -293,7 +293,11 @@ func TestProtocol_CloseGuardRespectDepTypes(t *testing.T) {
 		w.run("dep", "add", a, b, "--type", "blocks")
 
 		out, _ := w.tryRun("close", a)
-		if !strings.Contains(out, "blocked by open issues") {
+		// The embedded close path delegates to the engine's guarded close (S7),
+		// which surfaces storage.ErrCloseBlocked ("cannot close blocked issue:
+		// <id> is blocked by [...]"). The proxied path still uses the older
+		// "blocked by open issues" wording — accept either.
+		if !strings.Contains(out, "blocked by open issues") && !strings.Contains(out, "cannot close") {
 			t.Errorf("close of blocked issue should be rejected, got: %s", out)
 		}
 

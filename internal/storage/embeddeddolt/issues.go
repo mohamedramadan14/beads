@@ -134,7 +134,7 @@ func (s *EmbeddedDoltStore) CloseIssue(ctx context.Context, id string, reason st
 }
 
 // CloseIssueChecked closes an issue but refuses with storage.ErrCloseBlocked
-// when it is still blocked (is_blocked=1) unless opts.Force is set, and — when
+// when it has a live direct blocker unless opts.Force is set, and — when
 // opts.ExpectedVersion is non-nil — with storage.ErrVersionMismatch when the
 // row's current RowVersion no longer matches (an orthogonal CAS that Force does
 // not bypass). Both checks and the close share one transaction, so they are

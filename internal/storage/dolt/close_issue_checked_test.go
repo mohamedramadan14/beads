@@ -157,6 +157,91 @@ func TestCloseIssueChecked(t *testing.T) {
 			},
 		},
 		{
+			// The guard refuses only on a LIVE direct blocker, matching the
+			// historical `bd close` predicate (blocked && len(blockers) > 0). A
+			// transitively-blocked child (parent-child of a blocked parent) has
+			// is_blocked=1 but NO direct blocker of its own, so it must close
+			// without Force.
+			name: "transitively blocked child closes without force",
+			setup: func(t *testing.T) string {
+				blocker, parent, child := "cic-trans-blocker", "cic-trans-parent", "cic-trans-child"
+				createPerm(t, ctx, store, blocker)
+				createPerm(t, ctx, store, parent)
+				createPerm(t, ctx, store, child)
+				if err := store.AddDependency(ctx, &types.Dependency{
+					IssueID: parent, DependsOnID: blocker, Type: types.DepBlocks,
+				}, "tester"); err != nil {
+					t.Fatalf("AddDependency(parent blocks blocker): %v", err)
+				}
+				if err := store.AddDependency(ctx, &types.Dependency{
+					IssueID: child, DependsOnID: parent, Type: types.DepParentChild,
+				}, "tester"); err != nil {
+					t.Fatalf("AddDependency(parent-child): %v", err)
+				}
+				// Precondition: the child inherits is_blocked=1 from its blocked
+				// parent, with no direct blocker edge of its own.
+				if !getIsBlocked(t, ctx, store, "issues", child) {
+					t.Fatalf("%s should inherit is_blocked=1 from blocked parent %s", child, parent)
+				}
+				return child
+			},
+			opts: storage.CloseIssueOptions{Reason: "done"},
+			check: func(t *testing.T, id string, res storage.CloseIssueResult, err error) {
+				if err != nil {
+					t.Fatalf("transitive-blocked close err = %v, want nil (no live direct blocker)", err)
+				}
+				if res.Unchanged {
+					t.Fatalf("res.Unchanged = true, want false (a real close)")
+				}
+				if got := getStatus(t, id); got != types.StatusClosed {
+					t.Fatalf("issue %s status = %q, want closed", id, got)
+				}
+			},
+		},
+		{
+			// A stale is_blocked=1 (its only direct blocker has since closed, but
+			// the denormalized column was not recomputed) must NOT refuse: the
+			// guard reads the LIVE blocker list — empty because the blocker is
+			// closed — and self-heals by closing.
+			name: "stale is_blocked with closed direct blocker closes",
+			setup: func(t *testing.T) string {
+				blocker, target := "cic-stale-blocker", "cic-stale-target"
+				createPerm(t, ctx, store, blocker)
+				createPerm(t, ctx, store, target)
+				if err := store.AddDependency(ctx, &types.Dependency{
+					IssueID: target, DependsOnID: blocker, Type: types.DepBlocks,
+				}, "tester"); err != nil {
+					t.Fatalf("AddDependency(blocks): %v", err)
+				}
+				if !getIsBlocked(t, ctx, store, "issues", target) {
+					t.Fatalf("%s should be is_blocked=1 after adding blocks dep", target)
+				}
+				// Close the blocker via a raw UPDATE that skips the is_blocked
+				// recompute, leaving target.is_blocked stale at 1 while its only
+				// direct blocker is now closed.
+				if _, err := store.db.ExecContext(ctx,
+					"UPDATE issues SET status = 'closed' WHERE id = ?", blocker); err != nil {
+					t.Fatalf("raw-close blocker: %v", err)
+				}
+				if !getIsBlocked(t, ctx, store, "issues", target) {
+					t.Fatalf("%s is_blocked column should still read stale-1", target)
+				}
+				return target
+			},
+			opts: storage.CloseIssueOptions{Reason: "done"},
+			check: func(t *testing.T, id string, res storage.CloseIssueResult, err error) {
+				if err != nil {
+					t.Fatalf("stale-blocked close err = %v, want nil (live blocker is closed; self-heals)", err)
+				}
+				if res.Unchanged {
+					t.Fatalf("res.Unchanged = true, want false (a real close)")
+				}
+				if got := getStatus(t, id); got != types.StatusClosed {
+					t.Fatalf("issue %s status = %q, want closed", id, got)
+				}
+			},
+		},
+		{
 			name:  "already closed is idempotent",
 			setup: func(t *testing.T) string { return mkClosed(t, "cic-idem") },
 			opts:  storage.CloseIssueOptions{Reason: "again"},

@@ -79,6 +79,57 @@ func TestEmbeddedCloseIssueChecked(t *testing.T) {
 	}
 }
 
+// TestEmbeddedCloseIssueCheckedTransitiveBlockedCloses proves the guard refuses
+// only on a LIVE direct blocker (blocked && len(blockers) > 0): a transitively-
+// blocked child (parent-child of a blocked parent) has is_blocked=1 but no direct
+// blocker of its own, so it closes without Force — the historical `bd close`
+// behavior, threaded through the embedded wrapper.
+func TestEmbeddedCloseIssueCheckedTransitiveBlockedCloses(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "cictr")
+	ctx := t.Context()
+
+	for _, id := range []string{"cictr-blocker", "cictr-parent", "cictr-child"} {
+		iss := &types.Issue{ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+		if err := te.store.CreateIssue(ctx, iss, "tester"); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	if err := te.store.AddDependency(ctx, &types.Dependency{
+		IssueID: "cictr-parent", DependsOnID: "cictr-blocker", Type: types.DepBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("AddDependency(parent blocks blocker): %v", err)
+	}
+	if err := te.store.AddDependency(ctx, &types.Dependency{
+		IssueID: "cictr-child", DependsOnID: "cictr-parent", Type: types.DepParentChild,
+	}, "tester"); err != nil {
+		t.Fatalf("AddDependency(parent-child): %v", err)
+	}
+	// The child inherits is_blocked=1 transitively, with NO direct blocker.
+	blocked, blockers, err := te.store.IsBlocked(ctx, "cictr-child")
+	if err != nil {
+		t.Fatalf("IsBlocked(child): %v", err)
+	}
+	if !blocked {
+		t.Fatal("cictr-child should inherit is_blocked=1 from its blocked parent")
+	}
+	if len(blockers) != 0 {
+		t.Fatalf("cictr-child should have NO direct blocker, got %v", blockers)
+	}
+
+	// No Force: the guard sees no live direct blocker and closes.
+	res, err := te.store.CloseIssueChecked(ctx, "cictr-child", "tester", storage.CloseIssueOptions{Reason: "done"})
+	if err != nil {
+		t.Fatalf("transitive-blocked close err = %v, want nil (no live direct blocker)", err)
+	}
+	if res.Unchanged {
+		t.Fatalf("res.Unchanged = true, want false (a real close)")
+	}
+	if iss, _ := te.store.GetIssue(ctx, "cictr-child"); iss.Status != types.StatusClosed {
+		t.Fatalf("cictr-child status = %q, want closed", iss.Status)
+	}
+}
+
 // TestEmbeddedCloseIssueCheckedVersionCAS proves the ExpectedVersion CAS wires
 // through the EmbeddedDoltStore's withConn wrapper: a matching version closes, a
 // stale version is refused atomically with storage.ErrVersionMismatch (issue

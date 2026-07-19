@@ -204,6 +204,84 @@ func TestEmbeddedClose(t *testing.T) {
 		cmd.CombinedOutput() // Don't check error — behavior varies.
 	})
 
+	// The delegated close (CloseIssueChecked) reports Unchanged for an already-
+	// closed issue. Re-closing must stay an idempotent success (exit 0, issue
+	// stays closed) — matching the old CloseIssue path, which returned nil for an
+	// already-closed issue. bdClose t.Fatalf's on non-zero exit, so this asserts
+	// the exit code.
+	t.Run("close_already_closed_is_idempotent_success", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "Idempotent close", "--type", "task")
+		bdClose(t, bd, dir, issue.ID)
+		bdClose(t, bd, dir, issue.ID) // second close: idempotent no-op, exit 0
+		got := bdShow(t, bd, dir, issue.ID)
+		if got.Status != types.StatusClosed {
+			t.Errorf("expected issue to remain closed after idempotent re-close, got %s", got.Status)
+		}
+	})
+
+	// Output parity: `bd close --json` on an already-closed bead must still emit
+	// the issue in the JSON array (the old CloseIssue path re-fetched and reported
+	// it). The Unchanged branch skips the real-close side effects but keeps the
+	// display, so the shape is unchanged.
+	t.Run("close_json_already_closed_emits_issue", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "JSON idempotent", "--type", "task")
+		bdClose(t, bd, dir, issue.ID) // first close
+		cmd := exec.Command(bd, "close", issue.ID, "--json")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		stdout, stderr, err := runCommandBuffers(t, cmd)
+		if err != nil {
+			t.Fatalf("bd close --json (already closed) failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+		}
+		s := stdout.String()
+		start := strings.Index(s, "[")
+		if start < 0 {
+			t.Fatalf("expected a JSON array for already-closed --json re-close, got: %s", s)
+		}
+		var issues []json.RawMessage
+		if jsonErr := json.Unmarshal([]byte(s[start:]), &issues); jsonErr != nil {
+			t.Fatalf("expected valid JSON array, got: %s (%v)", s[start:], jsonErr)
+		}
+		if len(issues) != 1 {
+			t.Fatalf("expected 1 issue in JSON for already-closed re-close (parity), got %d: %s", len(issues), s[start:])
+		}
+		if !strings.Contains(s, issue.ID) {
+			t.Errorf("expected already-closed issue %s in JSON output, got: %s", issue.ID, s)
+		}
+	})
+
+	// Mixed batch: one already-closed bead + one live bead. Both must appear in
+	// the JSON array — the already-closed one for output parity, the live one as a
+	// real close.
+	t.Run("close_json_mixed_batch_includes_already_closed", func(t *testing.T) {
+		already := bdCreate(t, bd, dir, "Mixed already", "--type", "task")
+		fresh := bdCreate(t, bd, dir, "Mixed fresh", "--type", "task")
+		bdClose(t, bd, dir, already.ID) // pre-close one
+
+		cmd := exec.Command(bd, "close", already.ID, fresh.ID, "--json")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		stdout, stderr, err := runCommandBuffers(t, cmd)
+		if err != nil {
+			t.Fatalf("bd close --json (mixed batch) failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+		}
+		s := stdout.String()
+		start := strings.Index(s, "[")
+		if start < 0 {
+			t.Fatalf("expected a JSON array for mixed-batch --json close, got: %s", s)
+		}
+		var issues []json.RawMessage
+		if jsonErr := json.Unmarshal([]byte(s[start:]), &issues); jsonErr != nil {
+			t.Fatalf("expected valid JSON array, got: %s (%v)", s[start:], jsonErr)
+		}
+		if len(issues) != 2 {
+			t.Fatalf("expected both issues in JSON (real close + already-closed parity), got %d: %s", len(issues), s[start:])
+		}
+		if !strings.Contains(s, already.ID) || !strings.Contains(s, fresh.ID) {
+			t.Errorf("expected both %s and %s in JSON output, got: %s", already.ID, fresh.ID, s)
+		}
+	})
+
 	t.Run("close_nonexistent_id", func(t *testing.T) {
 		bdCloseFail(t, bd, dir, "tc-nonexistent999")
 	})
@@ -232,6 +310,61 @@ func TestEmbeddedClose(t *testing.T) {
 		got := bdShow(t, bd, dir, blocked.ID)
 		if got.Status != types.StatusClosed {
 			t.Errorf("expected closed with --force, got %s", got.Status)
+		}
+	})
+
+	// Proves the S7 delegation: `bd close` on a blocked issue now surfaces the
+	// engine's atomic guard (storage.ErrCloseBlocked) rather than a duplicated
+	// CLI pre-check. The refusal must be atomic — the issue stays open because the
+	// guard and the close share one transaction — and the message must name the
+	// blocker and the --force hint. --force then bypasses the engine guard.
+	t.Run("close_blocked_delegated_guard", func(t *testing.T) {
+		blocker := bdCreate(t, bd, dir, "Deleg blocker", "--type", "task")
+		blocked := bdCreate(t, bd, dir, "Deleg blocked", "--type", "task")
+		bdDepAdd(t, bd, dir, blocked.ID, blocker.ID)
+
+		out := bdCloseFail(t, bd, dir, blocked.ID)
+		if !strings.Contains(out, "cannot close") {
+			t.Errorf("expected engine guard message ('cannot close'), got: %s", out)
+		}
+		if !strings.Contains(out, blocker.ID) {
+			t.Errorf("expected guard message to name blocker %s, got: %s", blocker.ID, out)
+		}
+		if !strings.Contains(out, "--force") {
+			t.Errorf("expected guard message to mention --force, got: %s", out)
+		}
+
+		// Atomic refuse: the guard ran in-transaction, so the issue must remain open.
+		got := bdShow(t, bd, dir, blocked.ID)
+		if got.Status == types.StatusClosed {
+			t.Error("expected blocked issue to remain open after the guard refused (atomic)")
+		}
+
+		// --force bypasses the engine guard.
+		bdClose(t, bd, dir, blocked.ID, "--force")
+		got = bdShow(t, bd, dir, blocked.ID)
+		if got.Status != types.StatusClosed {
+			t.Errorf("expected closed with --force, got %s", got.Status)
+		}
+	})
+
+	// The delegated guard refuses only on a LIVE direct blocker, matching the
+	// historical `bd close` predicate. A transitively-blocked child (parent-child
+	// of a blocked parent) has is_blocked=1 but no direct blocker of its own, so it
+	// must close WITHOUT --force — the historical behavior.
+	t.Run("close_transitively_blocked_closes_without_force", func(t *testing.T) {
+		blocker := bdCreate(t, bd, dir, "Trans blocker", "--type", "task")
+		parent := bdCreate(t, bd, dir, "Trans parent", "--type", "task")
+		child := bdCreate(t, bd, dir, "Trans child", "--type", "task")
+		// parent is blocked by an open blocker; child is a parent-child of parent,
+		// so child inherits is_blocked=1 transitively with no direct blocker.
+		bdDepAdd(t, bd, dir, parent.ID, blocker.ID)
+		bdDepAdd(t, bd, dir, child.ID, parent.ID, "--type", "parent-child")
+
+		bdClose(t, bd, dir, child.ID) // no --force
+		got := bdShow(t, bd, dir, child.ID)
+		if got.Status != types.StatusClosed {
+			t.Errorf("expected transitively-blocked child to close without --force, got %s", got.Status)
 		}
 	})
 

@@ -28,9 +28,18 @@ func CloseIssueWithoutEventInTx(ctx context.Context, tx DBTX, id string, reason,
 }
 
 // CloseIssueCheckedInTx closes an issue within a transaction, refusing with
-// storage.ErrCloseBlocked when it is still blocked (is_blocked=1) unless force
-// is set. The guard (IsBlockedInTx) and the close (CloseIssueInTx) share the
-// SAME transaction, so no blocker can clear between the check and the close.
+// storage.ErrCloseBlocked when it has a LIVE direct blocker unless force is set.
+// The guard (IsBlockedInTx) and the close (CloseIssueInTx) share the SAME
+// transaction, so no blocker can clear between the check and the close.
+//
+// The refuse predicate is the exact historical `bd close` guard:
+// blocked && len(blockers) > 0 — refuse only when the denormalized is_blocked
+// column is set AND there is at least one live, open direct blocker
+// (blocks/waits-for/conditional-blocks). A bare is_blocked=1 with no live direct
+// blocker is deliberately NOT refused: it is either a purely transitive block
+// (a parent-child child of a blocked parent — historically closable) or a stale
+// is_blocked column whose direct blockers have since closed. Reading the live
+// blocker list self-heals against a stale column instead of acting on it.
 //
 // When expectedVersion is non-nil it adds an ORTHOGONAL optimistic-concurrency
 // precondition: the row's current RowVersion (row_lock) must still equal
@@ -50,15 +59,8 @@ func CloseIssueCheckedInTx(ctx context.Context, tx DBTX, id, reason, actor, sess
 		if err != nil {
 			return nil, err
 		}
-		if blocked {
-			// A purely transitive block (e.g. an active parent-child chain)
-			// sets is_blocked=1 without any direct blocks/waits-for/
-			// conditional-blocks edge, so blockers is empty — omit the "blocked
-			// by" clause rather than render "blocked by []".
-			if len(blockers) > 0 {
-				return nil, fmt.Errorf("%w: %s is blocked by %v", storage.ErrCloseBlocked, id, blockers)
-			}
-			return nil, fmt.Errorf("%w: %s", storage.ErrCloseBlocked, id)
+		if blocked && len(blockers) > 0 {
+			return nil, fmt.Errorf("%w: %s is blocked by %v", storage.ErrCloseBlocked, id, blockers)
 		}
 	}
 	return CloseIssueInTx(ctx, tx, id, reason, actor, session)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -106,6 +107,7 @@ the flags appear in the command line.`,
 		// Direct mode
 		closedIssues := []*types.Issue{}
 		closedCount := 0
+		alreadyClosed := 0
 		firstClosedID := ""
 
 		for i, id := range resolvedIDs {
@@ -143,42 +145,58 @@ the flags appear in the command line.`,
 				}
 			}
 
-			// Check if issue has open blockers (GH#962)
-			if !force {
-				blocked, blockers, err := activeStore.IsBlocked(ctx, id)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
-					continue
+			// Delegate the is_blocked guard to the engine (GH#962). CloseIssueChecked
+			// runs the guard and the close in ONE transaction, so there is no
+			// read-then-write TOCTOU window between the check and the close. --force
+			// bypasses the guard; ExpectedVersion is unused on this path.
+			res, err := activeStore.CloseIssueChecked(ctx, id, actor, storage.CloseIssueOptions{
+				Reason:  reason,
+				Session: session,
+				Force:   force,
+			})
+			if err != nil {
+				if errors.Is(err, storage.ErrCloseBlocked) {
+					// The guard refused atomically; ErrCloseBlocked's message names the
+					// blockers. Preserve the actionable hint.
+					fmt.Fprintf(os.Stderr, "%v (use --force to override)\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
 				}
-				if blocked && len(blockers) > 0 {
-					fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
-					continue
-				}
-			}
-
-			if err := activeStore.CloseIssue(ctx, id, reason, actor, session); err != nil {
-				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
 				continue
 			}
-			mutatedStores[activeStore] = append(mutatedStores[activeStore], id)
+			if res.Unchanged {
+				// Already closed: an idempotent no-op. The old CloseIssue path also
+				// returned nil here and still reported the (already-closed) issue, so
+				// keep OUTPUT parity via the shared display block below — the issue
+				// stays in --json output and the text report exactly as before. But
+				// skip every real-state-change side effect: the audit entry (no
+				// spurious closed→closed), the pending-commit tracking (nothing to
+				// commit), molecule auto-close, and the suggest-next/newly-unblocked/
+				// claim-next paths (all gated on closedCount). Exit stays 0 via
+				// alreadyClosed.
+				alreadyClosed++
+			} else {
+				mutatedStores[activeStore] = append(mutatedStores[activeStore], id)
 
-			// Audit log the close (survives Dolt GC flatten)
-			oldStatus := "open"
-			if issue != nil {
-				oldStatus = string(issue.Status)
+				// Audit log the close (survives Dolt GC flatten)
+				oldStatus := "open"
+				if issue != nil {
+					oldStatus = string(issue.Status)
+				}
+				audit.LogFieldChange(id, "status", oldStatus, "closed", actor, reason)
+
+				closedCount++
+				if firstClosedID == "" {
+					firstClosedID = id
+				}
+
+				// Auto-close parent molecule if all steps are now complete.
+				// Runs against the same store the step was closed in.
+				autoCloseCompletedMolecule(ctx, activeStore, id, actor, session)
 			}
-			audit.LogFieldChange(id, "status", oldStatus, "closed", actor, reason)
 
-			closedCount++
-			if firstClosedID == "" {
-				firstClosedID = id
-			}
-
-			// Auto-close parent molecule if all steps are now complete.
-			// Runs against the same store the step was closed in.
-			autoCloseCompletedMolecule(ctx, activeStore, id, actor, session)
-
-			// Re-fetch for display
+			// Re-fetch for display. A real close and an idempotent no-op both report
+			// the closed issue here, matching the historical output shape.
 			closedIssue, _ := activeStore.GetIssue(ctx, id)
 
 			if jsonOutput {
@@ -308,7 +326,7 @@ the flags appear in the command line.`,
 		}
 
 		totalAttempted := len(resolvedIDs)
-		if totalAttempted > 0 && closedCount == 0 {
+		if totalAttempted > 0 && closedCount == 0 && alreadyClosed == 0 {
 			return SilentExit()
 		}
 		return nil

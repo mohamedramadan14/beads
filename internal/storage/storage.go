@@ -77,7 +77,10 @@ type Storage interface {
 	UpdateIssueType(ctx context.Context, id string, issueType string, actor string) error
 	CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error
 	// CloseIssueChecked closes an issue, but refuses with ErrCloseBlocked when
-	// the issue is still blocked (is_blocked=1) unless opts.Force is set. The
+	// the issue has a live direct blocker (an open blocks/waits-for/
+	// conditional-blocks edge) unless opts.Force is set — the historical
+	// `bd close` guard. A bare is_blocked=1 with no live direct blocker (a purely
+	// transitive parent-child block, or a stale column) is not refused. The
 	// blocked-check and the close run in ONE transaction, so the guard is atomic
 	// (no TOCTOU). When opts.ExpectedVersion is non-nil it adds an orthogonal
 	// optimistic-concurrency precondition: the close proceeds only if the issue's

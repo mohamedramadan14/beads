@@ -94,6 +94,70 @@ func TestReExportedSentinelCatchesRealProductionError(t *testing.T) {
 	}
 }
 
+// insertErrDepRepo returns preset errors from the two methods the domain
+// dependency use-case consults before its typed-conflict passthrough branches:
+// ValidateBlockingHierarchy (hierarchy conflict) and Insert (type conflict). Any
+// other call nil-panics through the embedded interface, keeping the stub honest
+// about the surface these branches touch.
+type insertErrDepRepo struct {
+	domain.DependencySQLRepository
+	hierarchyErr error
+	insertErr    error
+}
+
+func (r insertErrDepRepo) ValidateBlockingHierarchy(context.Context, *types.Dependency) error {
+	return r.hierarchyErr
+}
+
+func (r insertErrDepRepo) HasCycle(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (r insertErrDepRepo) Insert(context.Context, *types.Dependency, string, domain.DepInsertOpts) error {
+	return r.insertErr
+}
+
+// TestReExportedDependencyConflictTypes proves the public
+// beads.DependencyTypeConflictError and beads.DependencyHierarchyConflictError
+// aliases are the SAME struct types the engine returns: driving ACTUAL domain
+// use-case passthrough returns (the conflict is passed through unwrapped, the
+// property both write stacks now share), errors.As classifies each through the
+// public alias and reads its fields — no message parsing.
+func TestReExportedDependencyConflictTypes(t *testing.T) {
+	t.Parallel()
+
+	// Type conflict: a different-type edge already exists between the pair.
+	typeConflict := &domain.DependencyTypeConflictError{
+		IssueID: "a", DependsOnID: "b", ExistingType: "blocks", RequestedType: "related",
+	}
+	uc := domain.NewDependencyUseCase(insertErrDepRepo{insertErr: typeConflict})
+	err := uc.AddDependency(context.Background(),
+		&types.Dependency{IssueID: "a", DependsOnID: "b", Type: types.DepRelated}, "tester")
+	var gotType *beads.DependencyTypeConflictError
+	if !errors.As(err, &gotType) {
+		t.Fatalf("errors.As(real type-conflict err, *beads.DependencyTypeConflictError) = false; err = %v", err)
+	}
+	if gotType.IssueID != "a" || gotType.DependsOnID != "b" ||
+		gotType.ExistingType != "blocks" || gotType.RequestedType != "related" {
+		t.Errorf("extracted type-conflict fields = %+v, want {a b blocks related}", gotType)
+	}
+
+	// Hierarchy conflict: a blocking edge would gate an issue on its ancestor.
+	hierConflict := &domain.DependencyHierarchyConflictError{
+		IssueID: "child", BlockerID: "ancestor", BlockerIsAncestor: true,
+	}
+	uc = domain.NewDependencyUseCase(insertErrDepRepo{hierarchyErr: hierConflict})
+	err = uc.AddDependency(context.Background(),
+		&types.Dependency{IssueID: "child", DependsOnID: "ancestor", Type: types.DepBlocks}, "tester")
+	var gotHier *beads.DependencyHierarchyConflictError
+	if !errors.As(err, &gotHier) {
+		t.Fatalf("errors.As(real hierarchy-conflict err, *beads.DependencyHierarchyConflictError) = false; err = %v", err)
+	}
+	if gotHier.IssueID != "child" || gotHier.BlockerID != "ancestor" || !gotHier.BlockerIsAncestor {
+		t.Errorf("extracted hierarchy-conflict fields = %+v, want {child ancestor true}", gotHier)
+	}
+}
+
 // TestReExportFieldTooLong proves the public beads.ErrFieldTooLong alias is the
 // same value as the internal types sentinel and composes through errors.Is when
 // wrapped — the property length-validation callers rely on to detect an

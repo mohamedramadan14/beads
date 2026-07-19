@@ -219,8 +219,12 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 			}
 			return nil
 		}
-		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
-			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
+		return &domain.DependencyTypeConflictError{
+			IssueID:       dep.IssueID,
+			DependsOnID:   dep.DependsOnID,
+			ExistingType:  existingType,
+			RequestedType: string(dep.Type),
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check existing dependency: %w", err)
 	}

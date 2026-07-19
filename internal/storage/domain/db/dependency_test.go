@@ -144,6 +144,16 @@ func (s *testSuite) depInsertConflictingType() {
 	err := r.Insert(s.Ctx(), newDep("bd-dep-conf-1", "bd-dep-conf-2", types.DepRelated), "tester", domain.DepInsertOpts{})
 	s.Require().Error(err)
 	s.Contains(err.Error(), "already exists with type")
+
+	// Parity with the embedded issueops/DoltStore stack: the conflict is a typed
+	// *domain.DependencyTypeConflictError, errors.As-able with the existing and
+	// requested types readable off it.
+	var conflict *domain.DependencyTypeConflictError
+	s.Require().ErrorAs(err, &conflict)
+	s.Equal("bd-dep-conf-1", conflict.IssueID)
+	s.Equal("bd-dep-conf-2", conflict.DependsOnID)
+	s.Equal("blocks", conflict.ExistingType)
+	s.Equal("related", conflict.RequestedType)
 }
 
 func (s *testSuite) depInsertFKViolation() {

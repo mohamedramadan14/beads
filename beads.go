@@ -224,3 +224,13 @@ var (
 	ErrDependencyCycle = domain.ErrDependencyCycle
 	ErrFieldTooLong    = types.ErrFieldTooLong
 )
+
+// DependencyTypeConflictError is returned by AddDependency when an edge of a
+// different type already exists between the pair; callers errors.As it to read
+// the existing/requested types instead of parsing the message.
+type DependencyTypeConflictError = domain.DependencyTypeConflictError
+
+// DependencyHierarchyConflictError is returned by AddDependency when a blocking
+// edge would gate an issue on its own ancestor/descendant (a gate that can
+// never clear).
+type DependencyHierarchyConflictError = domain.DependencyHierarchyConflictError

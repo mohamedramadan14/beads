@@ -197,12 +197,12 @@ func TestApplyUpdateProxiedOne_RetriesWholeAttemptOnConflict(t *testing.T) {
 	withFakeProxiedUpdateEnv(t, provider)
 
 	in := &updateInput{fields: map[string]any{"title": "renamed"}}
-	got, ok, err := applyUpdateProxiedOne(context.Background(), "bd-retry-1", in)
+	got, failReason, err := applyUpdateProxiedOne(context.Background(), "bd-retry-1", in)
 	if err != nil {
 		t.Fatalf("applyUpdateProxiedOne: %v", err)
 	}
-	if !ok {
-		t.Fatalf("expected update to succeed after conflict retries")
+	if failReason != "" {
+		t.Fatalf("expected update to succeed after conflict retries, got failure: %s", failReason)
 	}
 	if got == nil || got.ID != "bd-retry-1" {
 		t.Fatalf("updated issue = %v, want bd-retry-1", got)
@@ -215,8 +215,8 @@ func TestApplyUpdateProxiedOne_RetriesWholeAttemptOnConflict(t *testing.T) {
 // TestApplyUpdateProxiedOne_ExhaustedConflictsFailLoudly proves a write that
 // never lands cannot exit as a success: when every attempt loses Dolt's
 // commit-time merge, the command reports the failure instead of printing
-// "✓ Updated" (ok=false suppresses the success line and flips the exit code
-// via SilentExit in runUpdateProxiedServer).
+// "✓ Updated" (a non-empty failReason suppresses the success line and drives
+// the non-zero exit via reportUpdateFailures in runUpdateProxiedServer).
 func TestApplyUpdateProxiedOne_ExhaustedConflictsFailLoudly(t *testing.T) {
 	oldMax := proxiedUpdateRetryMaxElapsed
 	proxiedUpdateRetryMaxElapsed = 150 * time.Millisecond
@@ -230,17 +230,17 @@ func TestApplyUpdateProxiedOne_ExhaustedConflictsFailLoudly(t *testing.T) {
 	withFakeProxiedUpdateEnv(t, provider)
 
 	var got *types.Issue
-	var ok bool
+	var failReason string
 	var err error
 	stderr := captureStderrDuring(t, func() {
 		in := &updateInput{fields: map[string]any{"title": "never lands"}}
-		got, ok, err = applyUpdateProxiedOne(context.Background(), "bd-retry-2", in)
+		got, failReason, err = applyUpdateProxiedOne(context.Background(), "bd-retry-2", in)
 	})
 	if err != nil {
 		t.Fatalf("applyUpdateProxiedOne returned hard error: %v", err)
 	}
-	if ok || got != nil {
-		t.Fatalf("ok=%v issue=%v: a write that never landed must not be reported as updated", ok, got)
+	if failReason == "" || got != nil {
+		t.Fatalf("failReason=%q issue=%v: a write that never landed must be reported as a failure", failReason, got)
 	}
 	if !strings.Contains(stderr, "retries exhausted") {
 		t.Errorf("stderr = %q, want a loud retries-exhausted failure", stderr)
@@ -264,12 +264,12 @@ func TestApplyUpdateProxiedOne_NothingToCommitWithoutConflictSucceeds(t *testing
 	withFakeProxiedUpdateEnv(t, provider)
 
 	in := &updateInput{fields: map[string]any{"title": "wisp-shaped"}}
-	got, ok, err := applyUpdateProxiedOne(context.Background(), "bd-retry-3", in)
+	got, failReason, err := applyUpdateProxiedOne(context.Background(), "bd-retry-3", in)
 	if err != nil {
 		t.Fatalf("applyUpdateProxiedOne: %v", err)
 	}
-	if !ok || got == nil {
-		t.Fatalf("ok=%v issue=%v: empty-working-set commit on an unconflicted attempt is a success", ok, got)
+	if failReason != "" || got == nil {
+		t.Fatalf("failReason=%q issue=%v: empty-working-set commit on an unconflicted attempt is a success", failReason, got)
 	}
 	if n := provider.uows.Load(); n != 1 {
 		t.Errorf("unit-of-work attempts = %d, want 1 (nothing-to-commit must not trigger retries)", n)

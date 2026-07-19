@@ -11,11 +11,11 @@ import (
 )
 
 // TestUpdateMergeOps_DoltEngine smokes the in-tx merge operations on the
-// embedded-Dolt reference backend. Its real job is pinning that the Dolt SQL
-// engine accepts the row-locking read the merge ops now emit
-// (issueops.GetIssueForUpdateInTx, SELECT ... FOR UPDATE): Dolt parses FOR
-// UPDATE as a no-op (no row locking), so a parse regression here would break
-// every `bd update --set-metadata` / `bd note` on a Dolt workspace.
+// embedded-Dolt reference backend: metadata edits and note appends are resolved
+// against the row read inside the mutation transaction (issueops.ResolveMergeOps),
+// with the store's whole-attempt retry preserving concurrent writers' keys. A
+// regression there would break every `bd update --set-metadata` / `bd note` on
+// a Dolt workspace.
 func TestUpdateMergeOps_DoltEngine(t *testing.T) {
 	te := newTestEnv(t, "mergeops")
 	ctx := t.Context()

@@ -196,29 +196,17 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
 
-	// Read old issue inside the transaction for consistency. When the update
-	// carries read-merge-write operations (metadata edits, note appends), the
-	// read must also LOCK the row (SELECT … FOR UPDATE): on Postgres/MySQL a
-	// plain read returns a stale MVCC snapshot while a concurrent writer holds
-	// the row lock, so the merge would erase that writer's committed keys.
-	// See GetIssueForUpdateInTx for the per-backend serialization argument.
-	var oldIssue *types.Issue
-	var err error
-	if HasMergeOps(updates) {
-		oldIssue, err = GetIssueForUpdateInTx(ctx, tx, id)
-	} else {
-		oldIssue, err = GetIssueInTx(ctx, tx, id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get issue for update: %w", err)
-	}
-
-	// Resolve read-merge-write operations against the locked row read in THIS
-	// transaction, so the backend serializes concurrent writers. Merging
-	// outside the mutation transaction — the CLI's old behavior — silently
-	// erased concurrent committed writes to sibling keys (GH audit: 7 of 200
-	// exit-0 --set-metadata writes lost).
-	updates, err = ResolveMergeOps(oldIssue, updates)
+	// Read the pre-update row inside the transaction and fold any
+	// read-merge-write operations (metadata edits, note appends) into concrete
+	// column values against THAT row. On Dolt — the only supported backend — a
+	// stale snapshot is made safe not by row locks (FOR UPDATE is a parse-only
+	// no-op) but by commit-time conflict detection plus the store's
+	// whole-attempt retry (withRetryTx), which re-runs this resolution against
+	// the winning writer's committed row. Merging outside the mutation
+	// transaction — the CLI's old behavior — silently erased concurrent
+	// committed writes to sibling keys (GH audit: 7 of 200 exit-0
+	// --set-metadata writes lost).
+	oldIssue, updates, err := readIssueAndResolveMergeOps(ctx, tx, id, updates)
 	if err != nil {
 		return nil, err
 	}
@@ -379,9 +367,10 @@ const (
 )
 
 // HasMergeOps reports whether the update map carries any read-merge-write
-// operation key. Updates with merge ops must read the row with
-// GetIssueForUpdateInTx (row write lock) so the merge input cannot be a stale
-// MVCC snapshot on Postgres/MySQL.
+// operation key. Updates with merge ops must resolve those ops against the row
+// read inside the same mutation transaction (see ResolveMergeOps); on Dolt the
+// store's whole-attempt retry then re-runs that resolution against the winning
+// writer's committed row.
 func HasMergeOps(updates map[string]interface{}) bool {
 	for _, op := range []string{OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpAppendNotes} {
 		if _, ok := updates[op]; ok {
@@ -392,83 +381,114 @@ func HasMergeOps(updates map[string]interface{}) bool {
 }
 
 // ResolveMergeOps rewrites merge-operation keys into concrete column values
-// using oldIssue, which the caller read (and locked) in the same transaction.
+// using oldIssue, which the caller read in the same mutation transaction.
 // Returns the input map unchanged when no operation keys are present;
 // otherwise returns a copy so the caller's map is not mutated.
 func ResolveMergeOps(oldIssue *types.Issue, updates map[string]interface{}) (map[string]interface{}, error) {
 	if !HasMergeOps(updates) {
 		return updates, nil
 	}
-	_, hasMerge := updates[OpMergeMetadata]
-	_, hasSet := updates[OpSetMetadata]
-	_, hasUnset := updates[OpUnsetMetadata]
-	_, hasAppend := updates[OpAppendNotes]
 
 	resolved := make(map[string]interface{}, len(updates))
 	for k, v := range updates {
-		switch k {
-		case OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpAppendNotes:
-		default:
+		if !isMergeOpKey(k) {
 			resolved[k] = v
 		}
 	}
 
-	if hasMerge || hasSet || hasUnset {
-		if _, direct := resolved["metadata"]; direct {
-			return nil, fmt.Errorf("cannot combine a metadata replacement with incremental metadata edits")
-		}
-		current := oldIssue.Metadata
-		if hasMerge {
-			normalized, err := storage.NormalizeMetadataValue(updates[OpMergeMetadata])
-			if err != nil {
-				return nil, fmt.Errorf("invalid %s: %w", OpMergeMetadata, err)
-			}
-			merged, err := storage.MergeMetadataJSON(current, json.RawMessage(normalized))
-			if err != nil {
-				return nil, fmt.Errorf("metadata merge failed: %w", err)
-			}
-			current = merged
-		}
-		if hasSet || hasUnset {
-			set, err := mergeOpStrings(OpSetMetadata, updates[OpSetMetadata], hasSet)
-			if err != nil {
-				return nil, err
-			}
-			unset, err := mergeOpStrings(OpUnsetMetadata, updates[OpUnsetMetadata], hasUnset)
-			if err != nil {
-				return nil, err
-			}
-			merged, err := storage.ApplyMetadataEdits(current, set, unset)
-			if err != nil {
-				return nil, fmt.Errorf("metadata edit failed: %w", err)
-			}
-			current = merged
-		}
-		// Validate the merged result, matching the schema check stores apply to
-		// direct metadata replacements (GH#1416 Phase 2).
-		if err := ValidateMetadataIfConfigured(current); err != nil {
-			return nil, err
-		}
-		resolved["metadata"] = current
+	if err := resolveMetadataMergeOps(oldIssue, updates, resolved); err != nil {
+		return nil, err
 	}
-
-	if hasAppend {
-		if _, direct := resolved["notes"]; direct {
-			return nil, fmt.Errorf("cannot combine a notes replacement with %s", OpAppendNotes)
-		}
-		text, ok := updates[OpAppendNotes].(string)
-		if !ok {
-			return nil, fmt.Errorf("%s must be a string, got %T", OpAppendNotes, updates[OpAppendNotes])
-		}
-		combined := oldIssue.Notes
-		if combined != "" {
-			combined += "\n"
-		}
-		combined += text
-		resolved["notes"] = combined
+	if err := resolveNotesAppendOp(oldIssue, updates, resolved); err != nil {
+		return nil, err
 	}
-
 	return resolved, nil
+}
+
+// isMergeOpKey reports whether k is a read-merge-write operation key consumed by
+// ResolveMergeOps rather than a concrete column value to pass through unchanged.
+func isMergeOpKey(k string) bool {
+	switch k {
+	case OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpAppendNotes:
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveMetadataMergeOps folds OpMergeMetadata/OpSetMetadata/OpUnsetMetadata
+// into a concrete "metadata" value on resolved, using oldIssue.Metadata (read in
+// the same mutation transaction) as the base. It is a no-op when no metadata
+// operation keys are present.
+func resolveMetadataMergeOps(oldIssue *types.Issue, updates, resolved map[string]interface{}) error {
+	_, hasMerge := updates[OpMergeMetadata]
+	_, hasSet := updates[OpSetMetadata]
+	_, hasUnset := updates[OpUnsetMetadata]
+	if !hasMerge && !hasSet && !hasUnset {
+		return nil
+	}
+	if _, direct := resolved["metadata"]; direct {
+		return fmt.Errorf("cannot combine a metadata replacement with incremental metadata edits")
+	}
+
+	current := oldIssue.Metadata
+	if hasMerge {
+		normalized, err := storage.NormalizeMetadataValue(updates[OpMergeMetadata])
+		if err != nil {
+			return fmt.Errorf("invalid %s: %w", OpMergeMetadata, err)
+		}
+		merged, err := storage.MergeMetadataJSON(current, json.RawMessage(normalized))
+		if err != nil {
+			return fmt.Errorf("metadata merge failed: %w", err)
+		}
+		current = merged
+	}
+	if hasSet || hasUnset {
+		set, err := mergeOpStrings(OpSetMetadata, updates[OpSetMetadata], hasSet)
+		if err != nil {
+			return err
+		}
+		unset, err := mergeOpStrings(OpUnsetMetadata, updates[OpUnsetMetadata], hasUnset)
+		if err != nil {
+			return err
+		}
+		merged, err := storage.ApplyMetadataEdits(current, set, unset)
+		if err != nil {
+			return fmt.Errorf("metadata edit failed: %w", err)
+		}
+		current = merged
+	}
+	// Validate the merged result, matching the schema check stores apply to
+	// direct metadata replacements (GH#1416 Phase 2).
+	if err := ValidateMetadataIfConfigured(current); err != nil {
+		return err
+	}
+	resolved["metadata"] = current
+	return nil
+}
+
+// resolveNotesAppendOp folds OpAppendNotes into a concrete "notes" value on
+// resolved, appending to oldIssue.Notes (read in the same mutation transaction).
+// It is a no-op when the append op is absent.
+func resolveNotesAppendOp(oldIssue *types.Issue, updates, resolved map[string]interface{}) error {
+	raw, ok := updates[OpAppendNotes]
+	if !ok {
+		return nil
+	}
+	if _, direct := resolved["notes"]; direct {
+		return fmt.Errorf("cannot combine a notes replacement with %s", OpAppendNotes)
+	}
+	text, ok := raw.(string)
+	if !ok {
+		return fmt.Errorf("%s must be a string, got %T", OpAppendNotes, raw)
+	}
+	combined := oldIssue.Notes
+	if combined != "" {
+		combined += "\n"
+	}
+	combined += text
+	resolved["notes"] = combined
+	return nil
 }
 
 // mergeOpStrings coerces a merge-operation value to []string. Accepts
@@ -494,6 +514,22 @@ func mergeOpStrings(op string, value interface{}, present bool) ([]string, error
 	default:
 		return nil, fmt.Errorf("%s must be a list of strings, got %T", op, value)
 	}
+}
+
+// readIssueAndResolveMergeOps reads the pre-update row in-transaction and folds
+// any merge-operation keys (metadata edits, note appends) into concrete column
+// values against that row, returning the row and the rewritten update map. It
+// keeps the read-merge-write plumbing off updateIssueInTx's already-large body.
+func readIssueAndResolveMergeOps(ctx context.Context, tx DBTX, id string, updates map[string]interface{}) (*types.Issue, map[string]interface{}, error) {
+	oldIssue, err := GetIssueInTx(ctx, tx, id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get issue for update: %w", err)
+	}
+	resolved, err := ResolveMergeOps(oldIssue, updates)
+	if err != nil {
+		return nil, nil, err
+	}
+	return oldIssue, resolved, nil
 }
 
 // RecordFullEventInTable records an event with both old and new values.

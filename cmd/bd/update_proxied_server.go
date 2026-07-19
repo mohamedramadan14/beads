@@ -40,19 +40,28 @@ func runUpdateProxiedServer(cmd *cobra.Command, ctx context.Context, args []stri
 		return nil
 	}
 
-	jsonOut, _ := cmd.Flags().GetBool("json")
+	// Derive success-output format from the global JSON decision (--json OR
+	// --format json OR config), the same signal reportUpdateFailures uses, so
+	// success output and the failure report never disagree on format within one
+	// invocation. This matches the non-proxied path in update.go.
+	jsonOut := jsonOutput
 	var updated []*types.Issue
-	var anyUpdated bool
+	// failures accumulates every requested ID that could not be updated —
+	// generic per-ID errors as well as a lost --claim race. In a mixed batch a
+	// later winner must NOT flip the exit code back to success and hide the
+	// failed IDs from exit-code automation; report them all and exit non-zero,
+	// mirroring the non-proxied path in update.go (beads audit finding #10).
+	var failures []updateIDFailure
 
 	for _, id := range args {
-		issue, ok, err := applyUpdateProxiedOne(ctx, id, in)
+		issue, failReason, err := applyUpdateProxiedOne(ctx, id, in)
 		if err != nil {
 			return err
 		}
-		if !ok {
+		if failReason != "" {
+			failures = append(failures, updateIDFailure{ID: id, Error: failReason})
 			continue
 		}
-		anyUpdated = true
 		if jsonOut {
 			updated = append(updated, issue)
 		} else {
@@ -63,8 +72,8 @@ func runUpdateProxiedServer(cmd *cobra.Command, ctx context.Context, args []stri
 	if jsonOut && len(updated) > 0 {
 		_ = outputJSON(updated)
 	}
-	if !anyUpdated {
-		return SilentExit()
+	if len(failures) > 0 {
+		return reportUpdateFailures(failures, len(args))
 	}
 	return nil
 }
@@ -81,20 +90,20 @@ func runUpdateProxiedServer(cmd *cobra.Command, ctx context.Context, args []stri
 // Redoing the attempt re-reads the winner's committed row, so merge
 // operations (metadata edits, note appends) resolve against authoritative
 // state instead of erasing it.
-func applyUpdateProxiedOne(ctx context.Context, id string, in *updateInput) (*types.Issue, bool, error) {
+func applyUpdateProxiedOne(ctx context.Context, id string, in *updateInput) (*types.Issue, string, error) {
 	if uowProvider == nil {
-		return nil, false, HandleError("proxied-server UOW provider not initialized")
+		return nil, "", HandleError("proxied-server UOW provider not initialized")
 	}
 
 	var issue *types.Issue
-	var updatedOK bool
+	var failReason string
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 25 * time.Millisecond
 	bo.MaxElapsedTime = proxiedUpdateRetryMaxElapsed
 	err := backoff.Retry(func() error {
 		var retryable bool
 		var attemptErr error
-		issue, updatedOK, retryable, attemptErr = applyUpdateProxiedAttempt(ctx, id, in)
+		issue, failReason, retryable, attemptErr = applyUpdateProxiedAttempt(ctx, id, in)
 		if attemptErr == nil {
 			return nil
 		}
@@ -108,24 +117,25 @@ func applyUpdateProxiedOne(ctx context.Context, id string, in *updateInput) (*ty
 			// Retries exhausted while losing Dolt's commit-time merge. The
 			// write did NOT land; fail loudly instead of exiting 0.
 			fmt.Fprintf(os.Stderr, "Error updating %s: retries exhausted on write conflicts: %v\n", id, err)
-			return nil, false, nil
+			return nil, fmt.Sprintf("retries exhausted on write conflicts: %v", err), nil
 		}
-		return nil, false, err
+		return nil, "", err
 	}
-	return issue, updatedOK, nil
+	return issue, failReason, nil
 }
 
 // applyUpdateProxiedAttempt runs one full read-merge-write attempt in a fresh
 // unit of work. retryable is true only for serialization failures, where the
 // server-side rollback guarantees nothing landed and the whole attempt is safe
 // to redo. Terminal per-issue failures (not found, claim conflicts, commit
-// errors) print to stderr and return ok=false with no error, preserving the
-// multi-ID loop's skip-and-continue behavior.
-func applyUpdateProxiedAttempt(ctx context.Context, id string, in *updateInput) (issue *types.Issue, ok, retryable bool, err error) {
+// errors) print to stderr and return a non-empty failReason with no error, so
+// the multi-ID loop records the failed ID, keeps going, and still exits
+// non-zero — matching the non-proxied path.
+func applyUpdateProxiedAttempt(ctx context.Context, id string, in *updateInput) (issue *types.Issue, failReason string, retryable bool, err error) {
 	uw, err := uowProvider.NewUOW(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening unit of work for %s: %v\n", id, err)
-		return nil, false, false, nil
+		return nil, fmt.Sprintf("opening unit of work: %v", err), false, nil
 	}
 	defer uw.Close(ctx)
 
@@ -137,15 +147,15 @@ func applyUpdateProxiedAttempt(ctx context.Context, id string, in *updateInput) 
 			current = wispCurrent
 		} else if err != nil {
 			fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
-			return nil, false, false, nil
+			return nil, fmt.Sprintf("resolving issue: %v", err), false, nil
 		} else {
 			fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
-			return nil, false, false, nil
+			return nil, "issue not found", false, nil
 		}
 	}
 	if err := validateIssueUpdatable(id, current); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
-		return nil, false, false, nil
+		return nil, err.Error(), false, nil
 	}
 
 	spec := buildUpdateSpecForIssue(current, in)
@@ -153,25 +163,25 @@ func applyUpdateProxiedAttempt(ctx context.Context, id string, in *updateInput) 
 	updated, err := issueUC.ApplyUpdate(ctx, id, spec, actor)
 	if err != nil {
 		if uow.IsSerializationError(err) {
-			return nil, false, true, err
+			return nil, "", true, err
 		}
 		if errors.Is(err, storage.ErrAlreadyClaimed) || errors.Is(err, storage.ErrNotClaimable) {
 			fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
+			return nil, fmt.Sprintf("claiming issue: %v", err), false, nil
 		}
-		return nil, false, false, nil
+		fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
+		return nil, fmt.Sprintf("updating: %v", err), false, nil
 	}
 
 	if err := uw.Commit(ctx, fmt.Sprintf("bd: update %s", id)); err != nil {
 		if uow.IsSerializationError(err) {
 			// Dolt rolled the whole transaction back server-side; nothing
 			// landed. Signal the caller to redo the read-merge-write.
-			return nil, false, true, err
+			return nil, "", true, err
 		}
 		if !isDoltNothingToCommit(err) {
 			fmt.Fprintf(os.Stderr, "Error committing %s: %v\n", id, err)
-			return nil, false, false, nil
+			return nil, fmt.Sprintf("committing: %v", err), false, nil
 		}
 		// "Nothing to commit" here is the legitimately-empty working set:
 		// wisp-only updates live in dolt_ignored tables, so a successful
@@ -184,7 +194,7 @@ func applyUpdateProxiedAttempt(ctx context.Context, id string, in *updateInput) 
 	if err := fireProxiedUpdateHooks(ctx, current, updated); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: %s: %v\n", id, err)
 	}
-	return updated, true, false, nil
+	return updated, "", false, nil
 }
 
 func fireProxiedUpdateHooks(ctx context.Context, before, after *types.Issue) error {

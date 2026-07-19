@@ -8,6 +8,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -196,6 +197,12 @@ type Storage interface {
 	SlotSet(ctx context.Context, issueID, key, value, actor string) error
 	SlotGet(ctx context.Context, issueID, key string) (string, error)
 	SlotClear(ctx context.Context, issueID, key, actor string) error
+
+	// MergeMetadata merges a single key into an issue's metadata JSON as a raw
+	// JSON value (nested objects/arrays are preserved). The read-modify-write
+	// runs in a single transaction, so two concurrent merges of DIFFERENT keys
+	// both survive rather than clobbering each other. SlotSet is built on it.
+	MergeMetadata(ctx context.Context, issueID, key string, value json.RawMessage, actor string) error
 
 	// Lifecycle
 	Close() error

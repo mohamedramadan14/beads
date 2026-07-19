@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -693,6 +694,13 @@ func (s *InstrumentedStorage) SlotGet(ctx context.Context, issueID, key string) 
 func (s *InstrumentedStorage) SlotClear(ctx context.Context, issueID, key, actor string) error {
 	ctx, span, t := s.op(ctx, "SlotClear", attribute.String("slot.key", key))
 	err := s.inner.SlotClear(ctx, issueID, key, actor)
+	s.done(ctx, span, t, err)
+	return err
+}
+
+func (s *InstrumentedStorage) MergeMetadata(ctx context.Context, issueID, key string, value json.RawMessage, actor string) error {
+	ctx, span, t := s.op(ctx, "MergeMetadata", attribute.String("slot.key", key))
+	err := s.inner.MergeMetadata(ctx, issueID, key, value, actor)
 	s.done(ctx, span, t, err)
 	return err
 }

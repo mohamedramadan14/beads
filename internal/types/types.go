@@ -50,10 +50,33 @@ type Issue struct {
 	// ===== Leasing (claim TTL + heartbeat; migrations 0054/0055) =====
 	// Hydrated from the ephemeral, node-local leases table (bd-lrgn1), not
 	// from issues columns. NULL when there is no active lease on this node.
-	// row_lock is an internal serialization mechanism (an issues column) and
-	// is intentionally NOT surfaced here.
+	// row_lock is an internal serialization mechanism (an issues column); it is
+	// surfaced read-only to Go callers as RowVersion in the Concurrency group
+	// below (json:"-", never serialized).
 	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"` // When the current claim's lease expires
 	HeartbeatAt    *time.Time `json:"heartbeat_at,omitempty"`     // Last heartbeat from the lease owner
+
+	// ===== Concurrency (Go-only; never serialized) =====
+	// RowVersion is an opaque optimistic-concurrency token for the library's own
+	// Go call sites: the issues/wisps row_lock cell, a random non-zero value the
+	// engine rewrites on every status/ownership-mutating write. It is
+	// EQUALITY-ONLY — compare it, never order or interpret it — and a change
+	// signals the row was mutated since you read it. It is json:"-" on purpose:
+	// row_lock is random per write, so serializing it would break stable bd
+	// --json goldens and bd export round-trips; a Go consumer reads
+	// issue.RowVersion directly instead.
+	//
+	// Coverage is deliberately partial: it changes on claim/close/unclaim and the
+	// generic update path, but NOT on direct-UPDATE paths that rewrite text
+	// without touching row_lock (RestoreFromSnapshotInTx, the compaction
+	// text-truncation path). For a complete change-detection key, combine it with
+	// updated_at (which those paths DO bump), status, and the label set
+	// (label-only and reopen writes change those, not row_lock).
+	//
+	// 0 appears only on legacy rows backfilled by migration 0054 (DEFAULT 0) that
+	// have not been mutated since; any issue created by the current code path is
+	// non-zero (create stamps freshRowLock()).
+	RowVersion int64 `json:"-"`
 
 	// ===== Time-Based Scheduling (GH#820) =====
 	DueAt      *time.Time `json:"due_at,omitempty"`      // When this issue should be completed
